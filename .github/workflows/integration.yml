@@ -1,0 +1,93 @@
+name: integration
+
+# Real end-to-end browser validation against the dedicated Supabase project:
+# real sign-in through the auth UI, no interception of Supabase requests.
+# Populates a deterministic demonstration dataset, screenshots every principal
+# surface (desktop + mobile), verifies the critical flows, cleans up after
+# itself, and uploads the screenshots as artifacts.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["claude/**"]
+
+jobs:
+  # Secrets cannot be read in a job-level `if`, so a preflight job surfaces
+  # their presence. On push without secrets the browser job SKIPS (neutral —
+  # the hermetic workflow still gates the commit); an explicit dispatch
+  # without secrets still FAILS CLOSED loudly below.
+  preflight:
+    runs-on: ubuntu-latest
+    outputs:
+      configured: ${{ steps.probe.outputs.configured }}
+    steps:
+      - id: probe
+        env:
+          A: ${{ secrets.CCC_TEST_EMAIL_A }}
+          P: ${{ secrets.CCC_TEST_PASSWORD }}
+          # Version creation is a server-only operation; without this key the
+          # generation and manual-version routes answer 503 by design.
+          S: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          if [ -n "$A" ] && [ -n "$P" ] && [ -n "$S" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::CCC_TEST_EMAIL_A / CCC_TEST_PASSWORD / SUPABASE_SERVICE_ROLE_KEY are not all configured; the browser job is skipped on push and fails closed on dispatch."
+          fi
+
+  browser:
+    runs-on: ubuntu-latest
+    needs: preflight
+    if: needs.preflight.outputs.configured == 'true' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Fail closed without secrets
+        env:
+          A: ${{ secrets.CCC_TEST_EMAIL_A }}
+          P: ${{ secrets.CCC_TEST_PASSWORD }}
+          S: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          if [ -z "$A" ] || [ -z "$P" ] || [ -z "$S" ]; then
+            echo "::error::CCC_TEST_EMAIL_A, CCC_TEST_PASSWORD and SUPABASE_SERVICE_ROLE_KEY secrets are all required. Refusing to run."
+            exit 1
+          fi
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - run: npm run build
+      - name: Start production server
+        # CCC_AI_TRANSPORT=stub: deterministic canned transport, applied AFTER
+        # the real source-graph gate — generation flows are testable without a
+        # provider credential and produce clearly-labeled "[stub]" content.
+        #
+        # SUPABASE_SERVICE_ROLE_KEY goes to the SERVER PROCESS ONLY. It has no
+        # NEXT_PUBLIC_ prefix, so it is never inlined into a browser bundle,
+        # and it is deliberately not exposed to the Playwright step below —
+        # the script drives the app as a real user, through the protected
+        # routes, exactly as a browser would.
+        env:
+          CCC_AI_TRANSPORT: stub
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: npm run start -- -p 3100 &
+      - name: Wait for server
+        run: |
+          for i in $(seq 1 60); do
+            curl -sf http://localhost:3100/login > /dev/null && exit 0
+            sleep 1
+          done
+          echo "::error::server did not start" && exit 1
+      - name: Real browser integration flow
+        env:
+          CCC_TEST_EMAIL_A: ${{ secrets.CCC_TEST_EMAIL_A }}
+          CCC_TEST_PASSWORD: ${{ secrets.CCC_TEST_PASSWORD }}
+        run: node scripts/integration-live.mjs http://localhost:3100 docs/validation/live
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-screens
+          path: docs/validation/live

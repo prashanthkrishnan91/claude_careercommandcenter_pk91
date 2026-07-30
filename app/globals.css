@@ -1,0 +1,88 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html {
+  height: 100%;
+}
+
+/* Flat zinc/slate base — no gradients, no decorative color (v2.2 §3). */
+body {
+  min-height: 100%;
+  background: #0c0d10;
+  color: #e7e9ef;
+  font-feature-settings: "tnum" 1;
+  -webkit-font-smoothing: antialiased;
+}
+
+::selection {
+  background: rgba(91, 157, 255, 0.28);
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #2c3038 transparent;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  background: #2c3038;
+  border-radius: 4px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+@layer components {
+  .microlabel {
+    @apply font-mono text-[10px] uppercase tracking-[0.14em] text-dim-500;
+  }
+
+  .panel {
+    @apply border border-ink-700 bg-ink-850 rounded-sm;
+  }
+
+  .hairline-b {
+    @apply border-b border-ink-700;
+  }
+
+  kbd {
+    @apply inline-flex min-w-[1.4rem] items-center justify-center rounded-sm border border-ink-600 bg-ink-800 px-1.5 py-0.5 font-mono text-[10px] uppercase leading-none text-dim-300;
+    box-shadow: inset 0 -1px 0 rgba(0, 0, 0, 0.5);
+  }
+
+  .field-input {
+    @apply w-full rounded-sm border border-ink-600 bg-ink-900 px-2.5 py-1.5 text-sm text-dim-100 outline-none placeholder:text-dim-500/60 focus:border-signal-blue/60 focus:ring-1 focus:ring-signal-blue/30;
+  }
+
+  .field-label {
+    @apply microlabel mb-1 block;
+  }
+
+  .btn {
+    @apply inline-flex items-center gap-1.5 rounded-sm border border-ink-600 bg-ink-800 px-2.5 py-1.5 font-mono text-[11px] uppercase tracking-[0.1em] text-dim-200 transition-colors hover:border-dim-500 hover:text-dim-100 focus:outline-none focus:ring-1 focus:ring-signal-blue/40 disabled:opacity-50;
+  }
+
+  .btn-primary {
+    @apply btn border-signal-blue/50 bg-signal-blue/10 text-signal-blue hover:border-signal-blue hover:bg-signal-blue/15 hover:text-signal-blue;
+  }
+
+  .btn-quiet {
+    @apply font-mono text-[10px] uppercase tracking-[0.12em] text-dim-500 hover:text-dim-300;
+  }
+
+  /* Lifecycle visual treatment (v2.2 §3): active full, archived muted,
+     draft dashed border + italic headline. */
+  .row-draft {
+    @apply border border-dashed border-ink-600 italic;
+  }
+  .row-archived {
+    @apply opacity-50;
+  }
+}
