@@ -9,6 +9,7 @@ import RowList from "@/components/RowList";
 import { useShell } from "@/components/ShellContext";
 import { SpecAddForm, normalizeSpecValues, type FieldSpec } from "@/components/SpecForm";
 import { archiveRow, createRow, listRows, updateRow } from "@/lib/genericRepo";
+import { addAssetToCollection, AssetGateError } from "@/lib/assetService";
 import { useVaultData } from "@/lib/hooks";
 import { listAchievements } from "@/lib/repos";
 import { getSupabase } from "@/lib/supabase";
@@ -26,13 +27,15 @@ export default function AssetsPage() {
   const { bump } = useShell();
   const db = getSupabase();
   const loader = useCallback(async (dbc: SupabaseClient) => {
-    const [assets, collections, achievements, archetypes] = await Promise.all([
+    const [assets, collections, achievements, archetypes, sourceLinks, memberships] = await Promise.all([
       listRows<CareerAsset>(dbc, "career_assets", { includeArchived: true }),
       listRows<AssetCollection>(dbc, "asset_collections", {}),
       listAchievements(dbc),
       listRows<TargetArchetype>(dbc, "target_archetypes", {}),
+      listRows<{ asset_fk: string; achievement_fk: string }>(dbc, "asset_source_achievements", { includeArchived: true }),
+      listRows<{ collection_fk: string; asset_fk: string }>(dbc, "collection_assets", { includeArchived: true }),
     ]);
-    return { assets, collections, achievements, archetypes };
+    return { assets, collections, achievements, archetypes, sourceLinks, memberships };
   }, []);
   const { data, loading, error } = useVaultData(loader);
   if (loading) return <p className="microlabel animate-pulse p-8">loading…</p>;
@@ -62,11 +65,16 @@ export default function AssetsPage() {
             )}
             onCreate={async (values) => {
               const v = normalizeSpecValues(ASSET_SPECS, values) as Record<string, unknown>;
-              await createRow(db, "career_assets", {
+              const created = await createRow<CareerAsset>(db, "career_assets", {
                 asset_type: v.asset_type,
-                source_achievement_refs: v.source_achievement ? [v.source_achievement] : [],
                 target_archetype_fk: v.target_archetype_fk ?? null,
               });
+              if (v.source_achievement) {
+                await createRow(db, "asset_source_achievements", {
+                  asset_fk: created.id,
+                  achievement_fk: v.source_achievement,
+                });
+              }
               bump();
             }}
           />
@@ -90,8 +98,9 @@ export default function AssetsPage() {
               <span className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
                 <span className="w-32 font-mono text-[10px] uppercase text-dim-400">{a.asset_type.replace("_", " ")}</span>
                 <span className="min-w-0 flex-1 truncate text-[13px] text-dim-100">
-                  {a.source_achievement_refs.map((r) => achName.get(r) ?? "?").join(" + ") || "(no sources)"}
+                  {(data.sourceLinks.filter((l) => l.asset_fk === a.id).map((l) => achName.get(l.achievement_fk) ?? "?").join(" + ")) || "(no sources)"}
                 </span>
+                {a.eligibility_stale_bool && <span className="font-mono text-[10px] uppercase text-signal-red">stale sources</span>}
                 {a.target_archetype_fk && <span className="text-[11px] text-dim-500">→ {archName.get(a.target_archetype_fk)}</span>}
                 {a.used_externally_bool && <span className="font-mono text-[10px] uppercase text-signal-blue">used externally</span>}
                 <PrivacyBadge value={a.privacy_class} />
@@ -123,7 +132,28 @@ export default function AssetsPage() {
                 <li key={c.id} className="flex flex-wrap items-baseline gap-x-3 gap-y-1 px-4 py-2">
                   <span className="w-36 font-mono text-[10px] uppercase text-dim-400">{c.collection_type.replace("_", " ")}</span>
                   <span className="min-w-0 flex-1 truncate text-[13px] text-dim-100">{c.name}</span>
-                  <span className="font-mono text-[10px] text-dim-500">{c.asset_refs.length} asset(s)</span>
+                  <span className="font-mono text-[10px] text-dim-500">{data.memberships.filter((m) => m.collection_fk === c.id).length} asset(s)</span>
+                  {c.approved_by_user_bool ? (
+                    <span className="font-mono text-[10px] uppercase text-signal-green">approved</span>
+                  ) : (
+                    <button className="btn-quiet" onClick={() => void updateRow(db, "asset_collections", c.id, { approved_by_user_bool: true, approved_at: new Date().toISOString() }).then(bump)}>approve</button>
+                  )}
+                  <button
+                    className="btn-quiet"
+                    onClick={async () => {
+                      const name = window.prompt("Add which asset? (by source achievement name)");
+                      const link = data.sourceLinks.find((l) => (achName.get(l.achievement_fk) ?? "").toLowerCase() === name?.toLowerCase());
+                      if (!link) return;
+                      try {
+                        await addAssetToCollection(db, c.id, link.asset_fk);
+                      } catch (e) {
+                        window.alert(e instanceof AssetGateError ? e.message : "add failed");
+                      }
+                      bump();
+                    }}
+                  >
+                    + asset
+                  </button>
                   {c.current_bool ? (
                     <span className="font-mono text-[10px] uppercase text-signal-green">current</span>
                   ) : (

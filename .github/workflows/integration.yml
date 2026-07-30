@@ -8,6 +8,8 @@ name: integration
 
 on:
   workflow_dispatch:
+  push:
+    branches: ["claude/**"]
 
 jobs:
   browser:
@@ -31,6 +33,11 @@ jobs:
       - run: npx playwright install --with-deps chromium
       - run: npm run build
       - name: Start production server
+        # CCC_AI_TRANSPORT=stub: deterministic canned transport, applied AFTER
+        # the real source-graph gate — generation flows are testable without a
+        # provider credential and produce clearly-labeled "[stub]" content.
+        env:
+          CCC_AI_TRANSPORT: stub
         run: npm run start -- -p 3100 &
       - name: Wait for server
         run: |

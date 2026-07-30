@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { CandidateBadge, PrivacyBadge, StatusBadge, TruthBadge } from "@/components/Badges";
 import { VaultEmpty } from "@/components/EmptyState";
@@ -13,6 +13,7 @@ import { useShell } from "@/components/ShellContext";
 import { SpecAddForm, normalizeSpecValues, type FieldSpec } from "@/components/SpecForm";
 import { achievementMatches, EMPTY_FILTERS, projectMatches, type FilterState } from "@/lib/filters";
 import { useVaultData } from "@/lib/hooks";
+import { PromotionBlockedError, promoteAchievement } from "@/lib/promotion";
 import { archiveAchievement, createProject, listAchievements, listProjects } from "@/lib/repos";
 import { getSupabase } from "@/lib/supabase";
 import type { Achievement, Project } from "@/lib/types";
@@ -32,8 +33,10 @@ const PROJECT_SPECS: FieldSpec[] = [
 
 export default function VaultPage() {
   const router = useRouter();
-  const { bump } = useShell();
+  const { bump, helpOpen } = useShell();
   const [filters, setFilters] = useState<FilterState>(EMPTY_FILTERS);
+  const [sel, setSel] = useState(-1);
+  const [notice, setNotice] = useState<string | null>(null);
 
   const loader = useCallback(async (db: SupabaseClient) => {
     const [projects, achievements] = await Promise.all([
@@ -47,11 +50,11 @@ export default function VaultPage() {
   const grouped = useMemo(() => {
     if (!data) return [];
     const projectsById = new Map(data.projects.map((p) => [p.id, p]));
-    const visibleProjects = data.projects.filter(
-      (p) => (filters.status ? true : p.status !== "archived") && projectMatches({ ...filters, status: null, truth: null, candidateOnly: false }, p) || false,
-    );
-    // Achievements filter independently; a project stays visible if it matches
-    // or if any of its achievements match.
+    // Every filter — including status — applies to the project itself; when no
+    // status filter is set, archived projects are hidden by default. A project
+    // also stays visible whenever one of its achievements matches.
+    const matchesOwn = (p: Project) =>
+      (filters.status ? true : p.status !== "archived") && projectMatches(filters, p);
     const achByProject = new Map<string, Achievement[]>();
     for (const a of data.achievements) {
       if (!filters.status && a.status === "archived") continue;
@@ -60,9 +63,7 @@ export default function VaultPage() {
       list.push(a);
       achByProject.set(a.project_fk, list);
     }
-    const projects = data.projects.filter(
-      (p) => visibleProjects.includes(p) || achByProject.has(p.id),
-    );
+    const projects = data.projects.filter((p) => matchesOwn(p) || achByProject.has(p.id));
     const employers = new Map<string, Project[]>();
     for (const p of projects) {
       const key = p.employer || "(no employer)";
@@ -75,6 +76,86 @@ export default function VaultPage() {
       projects: list.map((p) => ({ project: p, achievements: achByProject.get(p.id) ?? [] })),
     }));
   }, [data, filters]);
+
+  // The flat achievement list in display order — the target of J/K selection.
+  const flat = useMemo(
+    () => grouped.flatMap((g) => g.projects.flatMap((p) => p.achievements)),
+    [grouped],
+  );
+
+  // Keyboard on the canonical hierarchy: J/K move across achievements,
+  // Enter/E open, ⌘⇧A archive, ⌘↵ promote (through the real gate — blocked
+  // reasons surface in the notice bar), Esc clears selection.
+  useEffect(() => {
+    function isEditableTarget(e: KeyboardEvent): boolean {
+      const t = e.target as HTMLElement | null;
+      if (!t) return false;
+      return t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || t.isContentEditable === true;
+    }
+    function onKey(e: KeyboardEvent) {
+      if (helpOpen) return;
+      const meta = e.metaKey || e.ctrlKey;
+      const selected = sel >= 0 ? flat[sel] : undefined;
+      if (meta && e.shiftKey && e.key.toLowerCase() === "a" && selected) {
+        e.preventDefault();
+        void archiveAchievement(getSupabase(), selected.id).then(bump);
+        return;
+      }
+      if (meta && !e.shiftKey && e.key === "Enter" && selected) {
+        e.preventDefault();
+        promoteAchievement(getSupabase(), selected.id, {
+          privacyAffirmed: false,
+          keepNeedsProofConfirmed: false,
+        })
+          .then(() => {
+            setNotice(null);
+            bump();
+          })
+          .catch((err) => {
+            setNotice(
+              err instanceof PromotionBlockedError
+                ? `Promotion blocked — ${err.reasons.join(" ")} Open the achievement to affirm and promote.`
+                : err instanceof Error
+                  ? err.message
+                  : "promotion failed",
+            );
+          });
+        return;
+      }
+      if (isEditableTarget(e) || meta || e.altKey) return;
+      if (e.key === "Escape") {
+        setSel(-1);
+        setNotice(null);
+        return;
+      }
+      if (flat.length === 0) return;
+      const key = e.key.toLowerCase();
+      if (key === "j") {
+        e.preventDefault();
+        setSel((s) => Math.min(flat.length - 1, s + 1));
+      } else if (key === "k") {
+        e.preventDefault();
+        setSel((s) => Math.max(0, s - 1));
+      } else if (key === "enter" || key === "e") {
+        if (!selected) return;
+        e.preventDefault();
+        router.push(`/vault/achievements/${selected.id}`);
+      }
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [flat, sel, helpOpen, bump, router]);
+
+  useEffect(() => {
+    if (sel >= flat.length) setSel(flat.length - 1);
+  }, [flat.length, sel]);
+
+  useEffect(() => {
+    if (sel < 0) return;
+    document
+      .querySelector(`[data-vault-row="${sel}"]`)
+      ?.scrollIntoView({ block: "nearest" });
+  }, [sel]);
 
   if (loading) return <p className="microlabel animate-pulse p-8">loading…</p>;
   if (error || !data) return <p className="p-8 text-[13px] text-signal-red">{error}</p>;
@@ -104,6 +185,12 @@ export default function VaultPage() {
       <div className="space-y-6 px-4 py-5 md:px-8">
         <QuickLogBar />
 
+        {notice && (
+          <p className="border-l-2 border-signal-amber pl-2 text-[12px] text-signal-amber" data-testid="vault-notice">
+            {notice}
+          </p>
+        )}
+
         {data.projects.length === 0 && <VaultEmpty />}
 
         {grouped.map(({ employer, projects }) => (
@@ -127,13 +214,19 @@ export default function VaultPage() {
                     <p className="px-4 py-2.5 text-[12px] text-dim-500">No achievements match — log one with Quick Log above.</p>
                   ) : (
                     <ul className="divide-y divide-ink-700/60">
-                      {achievements.map((a) => (
+                      {achievements.map((a) => {
+                        const flatIndex = flat.indexOf(a);
+                        return (
                         <li key={a.id} className={a.status === "archived" ? "row-archived" : ""}>
                           <button
-                            onClick={() => router.push(`/vault/achievements/${a.id}`)}
-                            className={`flex w-full flex-wrap items-baseline gap-x-3 gap-y-1 px-4 py-2 pl-7 text-left hover:bg-ink-800/40 ${
+                            data-vault-row={flatIndex}
+                            onClick={() => {
+                              setSel(flatIndex);
+                              router.push(`/vault/achievements/${a.id}`);
+                            }}
+                            className={`flex w-full flex-wrap items-baseline gap-x-3 gap-y-1 px-4 py-2 pl-7 text-left ${
                               a.status === "draft" ? "border-l-2 border-dashed border-l-signal-amber/50 italic" : "border-l-2 border-l-transparent"
-                            }`}
+                            } ${flatIndex === sel ? "bg-ink-800" : "hover:bg-ink-800/40"}`}
                           >
                             <span className="min-w-0 flex-1 truncate text-[13px] text-dim-100">{a.headline}</span>
                             <span className="font-mono text-[11px] text-dim-500">{a.end_date ?? a.start_date ?? "—"}</span>
@@ -143,7 +236,8 @@ export default function VaultPage() {
                             <CandidateBadge value={a.candidate_for_external_bool} />
                           </button>
                         </li>
-                      ))}
+                        );
+                      })}
                     </ul>
                   )}
                 </div>

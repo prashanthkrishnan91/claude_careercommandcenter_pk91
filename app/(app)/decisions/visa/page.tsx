@@ -55,6 +55,11 @@ export default function VisaPage() {
                   attorney {g.attorney_confirmed_at ? `confirmed ${g.attorney_confirmed_at.slice(0, 10)}` : "required"}
                 </span>
               )}
+              {g.ordinal === 7 && (
+                <span className={`font-mono text-[10px] uppercase ${g.qualifying_offer_fk ? "text-signal-green" : "text-signal-amber"}`}>
+                  {g.qualifying_offer_fk ? "qualifying offer linked" : "no qualifying offer — link one from the Offer Workbench"}
+                </span>
+              )}
               <select
                 className="rounded-sm border border-ink-600 bg-ink-900 px-1 py-0.5 font-mono text-[10px] uppercase text-dim-300"
                 value={g.status}

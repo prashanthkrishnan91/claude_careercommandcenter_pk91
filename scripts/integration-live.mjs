@@ -51,14 +51,28 @@ async function check(page, name, fn) {
 const visible = (page, sel, text) =>
   (text ? page.locator(sel, { hasText: text }) : page.locator(sel)).first().waitFor({ state: "visible", timeout: 15000 });
 
-// Cleanup through the API as the test user (isolated test tooling).
-async function wipe() {
+// Signed-in PostgREST client as the test user (test tooling; real RLS).
+async function signedClient() {
   const db = createClient(SUPABASE_URL, SUPABASE_KEY, { auth: { persistSession: false } });
   const { error } = await db.auth.signInWithPassword({ email: EMAIL, password: PASSWORD });
-  if (error) throw new Error(`cleanup sign-in failed: ${error.message}`);
+  if (error) throw new Error(`API sign-in failed: ${error.message}`);
+  return db;
+}
+
+// Cleanup through the API as the test user (isolated test tooling).
+async function wipe() {
+  const db = await signedClient();
+  // owner_overrides is client-read-only: disable through the audited RPC.
+  await db.rpc("ccc_set_override", { p_key: "maturity_dev_override", p_enabled: false, p_reason: "integration cleanup" });
+  await db.rpc("ccc_set_override", { p_key: "market_motion_override", p_enabled: false, p_reason: "integration cleanup" });
   await db.from("career_assets").update({ current_version_fk: null }).gte("created_at", "1970-01-01");
   for (const t of [
-    "asset_versions", "ingested_items", "ingestion_runs", "google_connections", "owner_overrides",
+    // junction tables cascade from their parents, but delete them explicitly
+    // so a partial parent wipe can never leave orphaned links behind
+    "reference_application_uses", "counter_benchmarks", "collection_assets",
+    "asset_source_achievements", "asset_source_evidence", "asset_source_metrics",
+    "story_achievements", "story_archetypes", "plan_archetypes",
+    "asset_versions", "ingested_items", "ingestion_runs", "google_connections",
     "references", "skill_development_progress", "skill_development_plans", "skill_evidence", "skills",
     "counter_proposals", "offer_scenarios", "offers", "comp_benchmarks", "interviews", "referrals",
     "outreach", "applications", "contacts", "companies", "ai_outputs", "action_items", "weekly_briefs",
@@ -170,6 +184,86 @@ try {
     await page.locator("span", { hasText: "Launched the executive retention dashboard" }).first().waitFor({ state: "visible" });
   });
 
+  // ── Release blocker #7: keyboard on the canonical Vault hierarchy ─────────
+  await check(page, "keyboard-jk-select-and-e-open", async () => {
+    await page.goto(`${BASE}/vault`);
+    await visible(page, "h2", "DIRECTV");
+    await page.keyboard.press("j");
+    await page.locator('[data-vault-row="0"].bg-ink-800').waitFor({ timeout: 5000 });
+    await page.keyboard.press("j");
+    await page.locator('[data-vault-row="1"].bg-ink-800').waitFor({ timeout: 5000 });
+    await page.keyboard.press("k");
+    await page.locator('[data-vault-row="0"].bg-ink-800').waitFor({ timeout: 5000 });
+    await page.keyboard.press("e");
+    await page.waitForURL("**/vault/achievements/**", { timeout: 10000 });
+  });
+
+  await check(page, "keyboard-cmd-enter-promotion-gate-and-escape", async () => {
+    await page.goto(`${BASE}/vault`);
+    await visible(page, "h2", "DIRECTV");
+    // select the DRAFT achievement (restored dashboard) wherever it sits
+    const rows = page.locator("[data-vault-row]");
+    const count = await rows.count();
+    let draftIndex = -1;
+    for (let i = 0; i < count; i++) {
+      const text = await rows.nth(i).innerText();
+      if (text.includes("Launched the executive retention dashboard")) draftIndex = i;
+    }
+    if (draftIndex < 0) throw new Error("draft achievement row not found");
+    for (let i = 0; i <= draftIndex; i++) await page.keyboard.press("j");
+    // ⌘/Ctrl+Enter runs the REAL promotion gate — affirmations are absent, so
+    // the calm blocked notice must appear (never a silent promotion).
+    await page.keyboard.press("Control+Enter");
+    await visible(page, '[data-testid="vault-notice"]', "Promotion blocked");
+    await page.keyboard.press("Escape");
+    await page.locator('[data-testid="vault-notice"]').waitFor({ state: "hidden", timeout: 5000 });
+  });
+
+  await check(page, "keyboard-cmd-shift-a-archives", async () => {
+    const rows = page.locator("[data-vault-row]");
+    const count = await rows.count();
+    let draftIndex = -1;
+    for (let i = 0; i < count; i++) {
+      const text = await rows.nth(i).innerText();
+      if (text.includes("Launched the executive retention dashboard")) draftIndex = i;
+    }
+    for (let i = 0; i <= draftIndex; i++) await page.keyboard.press("j");
+    await page.keyboard.press("Control+Shift+A");
+    // archived rows leave the default (unfiltered) hierarchy
+    await page
+      .locator("button", { hasText: "Launched the executive retention dashboard" })
+      .first()
+      .waitFor({ state: "hidden", timeout: 10000 });
+  });
+
+  // ── Release blocker #7: filter combinations on the hierarchy ──────────────
+  await check(page, "vault-filter-status-archived", async () => {
+    await page.locator("select").first().selectOption("archived");
+    await visible(page, "button", "Launched the executive retention dashboard");
+    await page.locator("select").first().selectOption("");
+  });
+
+  await check(page, "vault-filter-truth-hides-unproven", async () => {
+    await page.locator("select").nth(1).selectOption("VERIFIED");
+    await page
+      .locator("a", { hasText: "Churn forecasting overhaul" })
+      .waitFor({ state: "hidden", timeout: 10000 });
+    await page.getByRole("button", { name: "clear" }).click();
+    await visible(page, "a", "Churn forecasting overhaul");
+  });
+
+  await check(page, "vault-filter-employer-and-status-combined", async () => {
+    await page.locator("select").first().selectOption("draft");
+    await page.locator("select").nth(3).selectOption("DIRECTV");
+    await visible(page, "button", "Reduced churn forecast error by 18%"); // wait for filtered render
+    const archivedVisible = await page
+      .locator("button", { hasText: "Launched the executive retention dashboard" })
+      .isVisible()
+      .catch(() => false);
+    if (archivedVisible) throw new Error("status filter leaked an archived row");
+    await page.getByRole("button", { name: "clear" }).click();
+  });
+
   // Principal-surface screenshots (desktop).
   for (const [name, url, probe] of [
     ["home-command", "/home", "evidence health"],
@@ -186,6 +280,198 @@ try {
       await visible(page, "body", probe);
     });
   }
+
+  // ── Release blocker #6: database-authoritative maturity + logged override ──
+  await check(page, "p1-writes-blocked-at-database-while-locked", async () => {
+    const db = await signedClient();
+    try {
+      const { error } = await db.from("offers").insert({ role_title: "Too early" }).select();
+      if (!error || !/row-level security/.test(error.message)) {
+        throw new Error(`expected RLS rejection, got: ${error?.message ?? "success"}`);
+      }
+    } finally {
+      await db.auth.signOut();
+    }
+  });
+
+  await check(page, "settings-owner-override-requires-reason-and-logs", async () => {
+    await page.goto(`${BASE}/settings`);
+    await visible(page, "h2", "owner dev override");
+    page.once("dialog", (d) => d.accept("integration validation run"));
+    await page.getByRole("button", { name: "Enable override" }).click();
+    await visible(page, "span", "active");
+  });
+
+  // ── Release blocker #5: offer acceptance ⇄ Visa Gate 7 (specific offer) ────
+  let offerId = null;
+  await check(page, "offer-created-after-override", async () => {
+    await page.goto(`${BASE}/decisions/offers`);
+    await page.getByRole("button", { name: "+ Record offer" }).click();
+    await page.getByLabel(/Role title/i).or(page.getByPlaceholder(/role/i)).first().fill("Director, Analytics — OfferCo");
+    await page.getByRole("button", { name: "Add record offer" }).click();
+    await visible(page, "span", "Director, Analytics — OfferCo");
+  });
+
+  await check(page, "offer-accept-blocked-without-gate7", async () => {
+    await page.locator("li,button,span", { hasText: "Director, Analytics — OfferCo" }).first().click();
+    await page.waitForURL("**/decisions/offers/**", { timeout: 10000 });
+    await page.getByRole("button", { name: "Accept", exact: true }).click();
+    await visible(page, "p", "Gate 7");
+  });
+
+  await check(page, "offer-gate7-qualifying-offer-then-accept", async () => {
+    const db = await signedClient();
+    try {
+      const { data: offers } = await db.from("offers").select("*").eq("role_title", "Director, Analytics — OfferCo");
+      offerId = offers[0].id;
+      // attorney doc ref + gates 1–6 staged through the real API (real triggers)
+      await db.from("offers").update({ attorney_reviewed_doc_ref: "attorney-memo-integration.pdf" }).eq("id", offerId);
+      const { data: gates } = await db.from("visa_checklist_items").select("*").order("ordinal");
+      for (const g of gates.filter((g) => g.ordinal <= 6)) {
+        const { error } = await db.from("visa_checklist_items").update({
+          status: "complete",
+          attorney_confirmed_at: g.attorney_confirmation_required_bool ? new Date().toISOString() : null,
+        }).eq("id", g.id);
+        if (error) throw new Error(`gate ${g.ordinal}: ${error.message}`);
+      }
+    } finally {
+      await db.auth.signOut();
+    }
+    await page.reload();
+    // both written commitments through the UI
+    const boxes = page.locator('section input[type="checkbox"]');
+    await boxes.nth(0).check();
+    await boxes.nth(1).check();
+    await page.getByRole("button", { name: "Record attorney review" }).click();
+    await visible(page, "span", "reviewed");
+    await page.getByRole("button", { name: "Mark as Gate-7 qualifying offer" }).click();
+    await visible(page, "button", "✓ Gate-7 qualifying offer");
+    await page.getByRole("button", { name: "Accept", exact: true }).click();
+    await visible(page, "p", "status: accepted");
+  });
+
+  // ── Story bank: STAR entry + explicit approval ─────────────────────────────
+  await check(page, "story-bank-star-approval", async () => {
+    await page.goto(`${BASE}/intelligence/stories`);
+    await page.getByRole("button", { name: "+ New STAR story" }).click();
+    await page.locator("select").first().selectOption("leadership");
+    const areas = page.locator("textarea");
+    await areas.nth(0).fill("Churn spiked on the premium tier while leadership debated ownership.");
+    await areas.nth(1).fill("Own the cross-team response and the forecast rebuild.");
+    await areas.nth(2).fill("Stood up a 3-team working group and shipped weekly retrains.");
+    await areas.nth(3).fill("Forecast error down 18%; the board saw a stable retention picture.");
+    await page.getByRole("button", { name: "Add new star story" }).click();
+    await visible(page, "span", "Churn spiked on the premium tier");
+    await page.getByRole("button", { name: "approve", exact: true }).click();
+    await visible(page, "span", "approved");
+  });
+
+  // ── Archetypes: user-defined target ───────────────────────────────────────
+  await check(page, "archetype-created", async () => {
+    await page.goto(`${BASE}/intelligence/archetypes`);
+    await page.getByRole("button", { name: "+ New archetype" }).click();
+    await page.getByPlaceholder(/Director, Analytics @/).fill("Director, Analytics @ Tier-1 Tech");
+    await page.getByRole("button", { name: "Add new archetype" }).click();
+    await visible(page, "body", "Director, Analytics @ Tier-1 Tech");
+  });
+
+  // ── Release blockers #2/#3: asset gate blocks, then generates via the ──────
+  // deterministic stub transport (CCC_AI_TRANSPORT=stub on the server), then
+  // approval + external use — all through the real UI, API, and database.
+  await check(page, "asset-generation-blocked-by-truth-gate", async () => {
+    const db = await signedClient();
+    let achievementId;
+    try {
+      const { data } = await db.from("achievements").select("*").eq("headline", "Reduced churn forecast error by 18%");
+      achievementId = data[0].id;
+    } finally {
+      await db.auth.signOut();
+    }
+    await page.goto(`${BASE}/intelligence/assets`);
+    await page.getByRole("button", { name: "+ New asset" }).click();
+    const selects = page.locator("form select, dialog select, select");
+    await selects.first().selectOption("resume_bullet");
+    await selects.nth(1).selectOption(achievementId);
+    await page.getByRole("button", { name: "Add new asset" }).click();
+    await visible(page, "span", "Reduced churn forecast error by 18%");
+    await page.locator("li", { hasText: "resume bullet" }).first().click();
+    await page.waitForURL("**/intelligence/assets/**", { timeout: 10000 });
+    await page.getByRole("button", { name: "Generate version" }).click();
+    // the promoted achievement is still NEEDS_PROOF → the graph gate blocks,
+    // the blocked version is recorded with the failing claim named
+    await visible(page, "p", "NEEDS_PROOF");
+  });
+
+  await check(page, "asset-generates-approves-and-logs-external-use", async () => {
+    const db = await signedClient();
+    try {
+      await db.from("achievements")
+        .update({ truth_status: "VERIFIED", privacy_class: "PUBLIC_SAFE" })
+        .eq("headline", "Reduced churn forecast error by 18%");
+    } finally {
+      await db.auth.signOut();
+    }
+    await page.reload();
+    await page.getByRole("button", { name: "Generate version" }).click();
+    await visible(page, "p", "[stub] deterministic generated content");
+    await page.getByRole("button", { name: "Approve", exact: true }).first().click();
+    await visible(page, "span", "approved");
+    page.once("dialog", (d) => d.accept("LinkedIn profile"));
+    await page.getByRole("button", { name: "log external use" }).click();
+    await visible(page, "span", "LinkedIn profile");
+  });
+
+  // ── Weekly OS: Sunday Review brief ────────────────────────────────────────
+  await check(page, "rhythm-sunday-review-brief", async () => {
+    await page.goto(`${BASE}/rhythm`);
+    await visible(page, "body", "Sunday Review");
+    await page.getByRole("button", { name: "Run", exact: true }).first().click();
+    await visible(page, "body", "Sunday Review —");
+  });
+
+  // ── References overlay: willingness enforced by the database ──────────────
+  await check(page, "reference-use-blocked-until-willingness-confirmed", async () => {
+    const db = await signedClient();
+    try {
+      const { data: contact, error: ce } = await db.from("contacts")
+        .insert({ name: "Jordan Reeves" }).select().single();
+      if (ce) throw new Error(`contact: ${ce.message}`);
+      const { error: re } = await db.from("references")
+        .insert({ contact_fk: contact.id, reference_type: "manager" }).select().single();
+      if (re) throw new Error(`reference: ${re.message}`);
+      const { error: ae } = await db.from("applications")
+        .insert({ role_title: "Director, Analytics — OfferCo" }).select().single();
+      if (ae) throw new Error(`application: ${ae.message}`);
+    } finally {
+      await db.auth.signOut();
+    }
+    await page.goto(`${BASE}/development`);
+    await page.locator("summary", { hasText: "Jordan Reeves" }).click();
+    let alertText = "";
+    page.once("dialog", async (d) => {
+      if (d.type() === "prompt") await d.accept("Director, Analytics — OfferCo");
+      else {
+        alertText = d.message();
+        await d.accept();
+      }
+    });
+    page.once("dialog", async (d) => {
+      alertText = d.message();
+      await d.accept();
+    });
+    await page.getByRole("button", { name: /Use for application \(0\)/ }).click();
+    await page.waitForTimeout(1500);
+    if (!/willingness/.test(alertText)) throw new Error(`expected willingness rejection, got: ${alertText || "(none)"}`);
+  });
+
+  await check(page, "reference-use-allowed-once-confirmed", async () => {
+    await page.locator("summary", { hasText: "Jordan Reeves" }).locator("select").selectOption("confirmed");
+    await visible(page, "span", "confirmed");
+    await page.locator("summary", { hasText: "Jordan Reeves" }).click();
+    page.once("dialog", (d) => d.accept("Director, Analytics — OfferCo"));
+    await page.getByRole("button", { name: /Use for application \(0\)/ }).click();
+    await visible(page, "button", "Use for application (1)");
+  });
 
   await check(page, "mobile-vault-and-quicklog", async () => {
     await page.setViewportSize({ width: 390, height: 800 });

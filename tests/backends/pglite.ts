@@ -8,6 +8,8 @@ import type { TestBackend, TestUserCtx } from "./types";
 const MIGRATIONS = [
   path.resolve(__dirname, "../../supabase/migrations/20260730000100_p0a_canonical_schema.sql"),
   path.resolve(__dirname, "../../supabase/migrations/20260730002000_full_product_schema.sql"),
+  path.resolve(__dirname, "../../supabase/migrations/20260730010000_integrity_and_enforcement.sql"),
+  path.resolve(__dirname, "../../supabase/migrations/20260730020000_enforcement_corrections.sql"),
 ];
 
 // Minimal PostgREST-style query builder over PGlite, covering exactly the
@@ -172,6 +174,25 @@ class PgliteQuery implements PromiseLike<SbResult> {
 function makeClient(pg: PGlite, userId: string): SupabaseClient {
   const client = {
     from: (table: string) => new PgliteQuery(pg, table, userId),
+    // PostgREST-style RPC under the caller's RLS identity.
+    rpc: async (fn: string, args: Record<string, unknown> = {}) => {
+      if (!/^[a-z_][a-z0-9_]*$/.test(fn)) return { data: null, error: { message: "bad fn" } };
+      const keys = Object.keys(args);
+      // No to_jsonb wrapper: our RPCs return void/boolean/jsonb, all of which
+      // PGlite serializes directly (to_jsonb cannot accept void).
+      const call = `select public.${fn}(${keys.map((k, i) => `${k} := $${i + 1}`).join(", ")}) as row`;
+      try {
+        const rows = await pg.transaction(async (tx: Transaction) => {
+          await tx.query("select set_config('request.jwt.claim.sub', $1, true)", [userId]);
+          await tx.query("set local role authenticated");
+          const res = await tx.query<{ row: unknown }>(call, keys.map((k) => args[k]));
+          return res.rows;
+        });
+        return { data: rows[0]?.row ?? null, error: null };
+      } catch (e) {
+        return { data: null, error: { message: e instanceof Error ? e.message : String(e) } };
+      }
+    },
   };
   return client as unknown as SupabaseClient;
 }
@@ -219,6 +240,12 @@ export async function createPgliteBackend(): Promise<TestBackend> {
     },
     async cleanup() {
       await pg.exec(`
+        delete from public.override_mutations; delete from public.maturity_state;
+        delete from public.asset_source_achievements; delete from public.asset_source_evidence;
+        delete from public.asset_source_metrics; delete from public.collection_assets;
+        delete from public.story_achievements; delete from public.story_archetypes;
+        delete from public.plan_archetypes; delete from public.reference_application_uses;
+        delete from public.counter_benchmarks;
         update public.career_assets set current_version_fk = null;
         delete from public.asset_versions;
         delete from public.ingested_items; delete from public.ingestion_runs;

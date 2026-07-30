@@ -9,6 +9,7 @@ import { SpecAddForm, SpecCard, normalizeSpecValues, type FieldSpec } from "@/co
 import { archiveRow, createRow, listRows, updateRow } from "@/lib/genericRepo";
 import { useVaultData } from "@/lib/hooks";
 import { listAchievements } from "@/lib/repos";
+import type { Application } from "@/lib/entities";
 import { getSupabase } from "@/lib/supabase";
 import type {
   Contact,
@@ -64,7 +65,7 @@ export default function DevelopmentPage() {
   const { bump } = useShell();
   const db = getSupabase();
   const loader = useCallback(async (dbc: SupabaseClient) => {
-    const [skills, skillEvidence, plans, progress, references, contacts, achievements] = await Promise.all([
+    const [skills, skillEvidence, plans, progress, references, contacts, achievements, applications, refUses] = await Promise.all([
       listRows<Skill>(dbc, "skills", {}),
       listRows<SkillEvidence>(dbc, "skill_evidence", {}),
       listRows<SkillDevelopmentPlan>(dbc, "skill_development_plans", { includeArchived: true }),
@@ -72,8 +73,10 @@ export default function DevelopmentPage() {
       listRows<ReferenceRecord>(dbc, "references", {}),
       listRows<Contact>(dbc, "contacts", {}),
       listAchievements(dbc),
+      listRows<Application>(dbc, "applications", {}),
+      listRows<{ id: string; reference_fk: string; application_fk: string }>(dbc, "reference_application_uses", { includeArchived: true }),
     ]);
-    return { skills, skillEvidence, plans, progress, references, contacts, achievements };
+    return { skills, skillEvidence, plans, progress, references, contacts, achievements, applications, refUses };
   }, []);
   const { data, loading, error } = useVaultData(loader);
   if (loading) return <p className="microlabel animate-pulse p-8">loading…</p>;
@@ -267,6 +270,25 @@ export default function DevelopmentPage() {
                       >
                         Record narrative briefing
                       </button>
+                      {data.applications.length > 0 && (
+                        <button
+                          className="btn"
+                          title="Blocked by the database until willingness is confirmed"
+                          onClick={async () => {
+                            const name = window.prompt(`Use for which application?\n${data.applications.map((ap) => ap.role_title).join("\n")}`);
+                            const app = data.applications.find((ap) => ap.role_title.toLowerCase() === name?.toLowerCase());
+                            if (!app) return;
+                            try {
+                              await createRow(db, "reference_application_uses", { reference_fk: r.id, application_fk: app.id });
+                            } catch (e) {
+                              window.alert(e instanceof Error ? e.message : "blocked");
+                            }
+                            bump();
+                          }}
+                        >
+                          Use for application ({data.refUses.filter((u) => u.reference_fk === r.id).length})
+                        </button>
+                      )}
                       <span className="text-[11px] text-dim-500">
                         Willingness conversations and briefings happen externally; the app records outcomes only.
                         Use in applications requires willingness = confirmed (database-enforced).

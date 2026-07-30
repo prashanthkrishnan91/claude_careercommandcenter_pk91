@@ -31,11 +31,11 @@ async function checkDef(table: string, fragment: string): Promise<boolean> {
 }
 
 describe("fresh migration chain", () => {
-  it("applies successfully and creates all 36 product tables", async () => {
+  it("applies successfully and creates all 47 product tables", async () => {
     const rows = await sql(
       "select count(*) as n from information_schema.tables where table_schema='public'",
     );
-    expect(Number(rows[0].n)).toBe(36);
+    expect(Number(rows[0].n)).toBe(47);
   });
 });
 
@@ -121,29 +121,72 @@ describe("security objects", () => {
       "offers_application_same_user_fkey",
       "references_contact_same_user_fkey",
       "skill_evidence_achievement_same_user_fkey",
+      // normalized junction tables: BOTH parents via composite same-user FKs
+      "asa_asset_same_user_fkey",
+      "asa_achievement_same_user_fkey",
+      "ase_asset_same_user_fkey",
+      "ase_evidence_same_user_fkey",
+      "asm_asset_same_user_fkey",
+      "asm_metric_same_user_fkey",
+      "ca_collection_same_user_fkey",
+      "ca_asset_same_user_fkey",
+      "sta_story_same_user_fkey",
+      "sta_achievement_same_user_fkey",
+      "star_story_same_user_fkey",
+      "star_archetype_same_user_fkey",
+      "pa_plan_same_user_fkey",
+      "pa_archetype_same_user_fkey",
+      "rau_reference_same_user_fkey",
+      "rau_application_same_user_fkey",
+      "cb_counter_same_user_fkey",
+      "cb_benchmark_same_user_fkey",
+      // Gate 7 must reference a specific same-user qualifying offer
+      "visa_gate_offer_same_user_fkey",
     ]) {
       expect(names).toContain(expected);
     }
-    expect(names.length).toBeGreaterThanOrEqual(25);
+    expect(names.length).toBeGreaterThanOrEqual(43);
   });
-  it("no ccc_* function is SECURITY DEFINER", async () => {
+  it("SECURITY DEFINER is confined to the maturity/override functions that must write client-read-only tables", async () => {
+    // Justified definers: they write maturity_state / override_mutations /
+    // owner_overrides, which clients can only read. Everything else is invoker.
+    const JUSTIFIED = [
+      "ccc_set_override",
+      "ccc_override_active",
+      "ccc_p1_unlocked",
+      "ccc_recompute_maturity",
+      "ccc_log_override_mutation",
+    ];
     const rows = await sql(
-      `select proname, prosecdef from pg_proc where proname like 'ccc_%'`,
+      `select proname, prosecdef, proconfig from pg_proc where proname like 'ccc_%'`,
     );
-    expect(rows.length).toBeGreaterThanOrEqual(4);
-    for (const r of rows) expect(r.prosecdef).toBe(false);
+    expect(rows.length).toBeGreaterThanOrEqual(9);
+    for (const r of rows) {
+      if (JUSTIFIED.includes(String(r.proname))) {
+        expect(r.prosecdef, `${r.proname} definer`).toBe(true);
+        // a definer must pin its search_path
+        expect(String(r.proconfig ?? "")).toContain("search_path=public");
+      } else {
+        expect(r.prosecdef, `${r.proname} must be invoker`).toBe(false);
+      }
+    }
   });
-  it("RLS is enabled with 4 policies on every public table", async () => {
+  it("RLS is enabled on every public table; client-read-only tables carry only a select policy", async () => {
+    // maturity_state and override_mutations are written exclusively by the
+    // SECURITY DEFINER functions; owner_overrides only via ccc_set_override.
+    const READ_ONLY = ["maturity_state", "override_mutations", "owner_overrides"];
     const tables = await sql(
       `select c.relname, c.relrowsecurity,
               (select count(*) from pg_policy p where p.polrelid = c.oid) as policies
          from pg_class c join pg_namespace n on n.oid = c.relnamespace
         where n.nspname='public' and c.relkind='r'`,
     );
-    expect(tables.length).toBe(36);
+    expect(tables.length).toBe(47);
     for (const t of tables) {
       expect(t.relrowsecurity, `${t.relname} rls`).toBe(true);
-      expect(Number(t.policies), `${t.relname} policies`).toBe(4);
+      expect(Number(t.policies), `${t.relname} policies`).toBe(
+        READ_ONLY.includes(String(t.relname)) ? 1 : 4,
+      );
     }
   });
   it("grants: authenticated has table DML but anon has nothing", async () => {
@@ -155,10 +198,18 @@ describe("security objects", () => {
     expect(grantees).toContain("authenticated");
     expect(grantees).not.toContain("anon");
   });
-  it("enforcement triggers exist (offer acceptance gate, has_metric sync)", async () => {
+  it("enforcement triggers exist (offer acceptance, Gate 7, version chain, reference use)", async () => {
     const rows = await sql(`select tgname from pg_trigger where tgname like 'ccc_%'`);
     const names = rows.map((r) => String(r.tgname));
-    expect(names).toContain("ccc_offers_acceptance_gate");
-    expect(names).toContain("ccc_metrics_sync_has_metric");
+    for (const t of [
+      "ccc_offers_acceptance_gate",
+      "ccc_metrics_sync_has_metric",
+      "ccc_visa_gate7_check",
+      "ccc_assets_current_version_check",
+      "ccc_versions_supersession_check",
+      "ccc_reference_use_gate",
+    ]) {
+      expect(names).toContain(t);
+    }
   });
 });

@@ -7,7 +7,8 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import PageHeader from "@/components/PageHeader";
 import { useShell } from "@/components/ShellContext";
 import { postApi } from "@/lib/apiClient";
-import { getRow, listRows, updateRow, createRow } from "@/lib/genericRepo";
+import { approveVersion, authorManualVersion, logExternalUse, AssetGateError } from "@/lib/assetService";
+import { getRow, listRows } from "@/lib/genericRepo";
 import { useVaultData } from "@/lib/hooks";
 import { getAchievement } from "@/lib/repos";
 import { getSupabase } from "@/lib/supabase";
@@ -35,9 +36,13 @@ export default function AssetDetailPage() {
         ascending: false,
         includeArchived: true,
       });
+      const links = await listRows<{ achievement_fk: string }>(dbc, "asset_source_achievements", {
+        eq: { asset_fk: id },
+        includeArchived: true,
+      });
       const sources: Achievement[] = [];
-      for (const ref of asset?.source_achievement_refs ?? []) {
-        const a = await getAchievement(dbc, ref);
+      for (const link of links) {
+        const a = await getAchievement(dbc, link.achievement_fk);
         if (a) sources.push(a);
       }
       return { asset, versions, sources };
@@ -68,8 +73,13 @@ export default function AssetDetailPage() {
     <main>
       <PageHeader crumb="intelligence / assets" title={asset.asset_type.replace("_", " ")} />
       <div className="space-y-6 px-4 py-5 md:px-8">
+        {asset.eligibility_stale_bool && (
+          <p className="border-l-2 border-signal-red pl-2 text-[12px] text-signal-red">
+            Stale: {asset.eligibility_reason || "a source became ineligible after generation"} — approval and external use are blocked until resolved.
+          </p>
+        )}
         <section className="panel p-4">
-          <h2 className="microlabel mb-2">sources · truth/privacy gate runs before every generation</h2>
+          <h2 className="microlabel mb-2">sources · the full graph is revalidated on every generation, approval, and external use</h2>
           {data.sources.length === 0 ? (
             <p className="text-[12px] text-dim-500">No source achievements.</p>
           ) : (
@@ -119,7 +129,14 @@ export default function AssetDetailPage() {
                     {!v.blocked_bool && !v.approved_by_user_bool && (
                       <button
                         className="btn"
-                        onClick={() => void updateRow(db, "asset_versions", v.id, { approved_by_user_bool: true, approved_at: new Date().toISOString() }).then(bump)}
+                        onClick={async () => {
+                          try {
+                            await approveVersion(db, v.id);
+                          } catch (e) {
+                            setNotice(e instanceof AssetGateError ? e.message : e instanceof Error ? e.message : "approval failed");
+                          }
+                          bump();
+                        }}
                       >
                         Approve
                       </button>
@@ -131,10 +148,11 @@ export default function AssetDetailPage() {
                         onClick={async () => {
                           const destination = window.prompt("Where was this used? (application, LinkedIn, …)");
                           if (!destination) return;
-                          await updateRow(db, "career_assets", asset.id, {
-                            used_externally_bool: true,
-                            external_use_log: [...asset.external_use_log, { at: new Date().toISOString(), destination, version: v.version_number }],
-                          });
+                          try {
+                            await logExternalUse(db, asset.id, destination, v.version_number);
+                          } catch (e) {
+                            setNotice(e instanceof AssetGateError ? e.message : "external use blocked");
+                          }
                           bump();
                         }}
                       >
@@ -155,16 +173,7 @@ export default function AssetDetailPage() {
               onClick={async () => {
                 const content = window.prompt("Manual version content (authored by you, no AI):");
                 if (!content) return;
-                const next = data.versions.reduce((m, v) => Math.max(m, v.version_number), 0) + 1;
-                const created = await createRow<AssetVersion>(db, "asset_versions", {
-                  asset_fk: asset.id,
-                  version_number: next,
-                  content,
-                });
-                for (const prev of data.versions.filter((v) => !v.superseded_by_fk && !v.blocked_bool)) {
-                  await updateRow(db, "asset_versions", prev.id, { superseded_by_fk: created.id });
-                }
-                await updateRow(db, "career_assets", asset.id, { current_version_fk: created.id });
+                await authorManualVersion(db, asset.id, content);
                 bump();
               }}
             >

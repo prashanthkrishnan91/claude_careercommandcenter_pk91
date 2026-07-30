@@ -17,6 +17,7 @@ const GROUPS: Array<{ name: string; rows: Array<[string[], string]> }> = [
       [["↵"], "Open the selected row"],
       [["⌘", "↵"], "Promote an eligible draft achievement"],
       [["⌘", "⇧", "A"], "Archive the focused item"],
+      [["Esc"], "Clear the row selection"],
     ],
   },
   {

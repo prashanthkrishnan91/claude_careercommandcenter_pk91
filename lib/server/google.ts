@@ -39,7 +39,14 @@ export function decryptToken(stored: string): string {
   return Buffer.concat([decipher.update(data), decipher.final()]).toString("utf8");
 }
 
-export function authUrl(provider: "gmail" | "calendar", redirectUri: string, state: string): string {
+import { codeChallenge } from "./oauthState";
+
+export function authUrl(
+  provider: "gmail" | "calendar",
+  redirectUri: string,
+  stateNonce: string,
+  codeVerifier: string,
+): string {
   const params = new URLSearchParams({
     client_id: process.env.GOOGLE_CLIENT_ID ?? "",
     redirect_uri: redirectUri,
@@ -47,12 +54,14 @@ export function authUrl(provider: "gmail" | "calendar", redirectUri: string, sta
     scope: `${GOOGLE_SCOPES[provider]} email`,
     access_type: "offline",
     prompt: "consent",
-    state,
+    state: stateNonce, // opaque single-use nonce — never carries data
+    code_challenge: codeChallenge(codeVerifier),
+    code_challenge_method: "S256",
   });
   return `https://accounts.google.com/o/oauth2/v2/auth?${params}`;
 }
 
-export async function exchangeCode(code: string, redirectUri: string) {
+export async function exchangeCode(code: string, redirectUri: string, codeVerifier: string) {
   const res = await fetch("https://oauth2.googleapis.com/token", {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded" },
@@ -62,8 +71,10 @@ export async function exchangeCode(code: string, redirectUri: string) {
       client_secret: process.env.GOOGLE_CLIENT_SECRET ?? "",
       redirect_uri: redirectUri,
       grant_type: "authorization_code",
+      code_verifier: codeVerifier,
     }),
   });
+  // Never surface the exchange response body — status only.
   if (!res.ok) throw new Error(`token exchange failed: ${res.status}`);
   return (await res.json()) as { access_token: string; refresh_token?: string; id_token?: string };
 }

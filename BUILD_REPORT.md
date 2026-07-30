@@ -28,6 +28,24 @@ empty Pipeline. This branch is a ground-up correction (history rewritten):
 | JSON export in Settings | removed (v2.2.2 C1 defers export) |
 | Cmd+Shift+A = new achievement | Cmd+Shift+A = archive focused item; N = quick log in context |
 
+## Release-blocker correction pass (semantic review → fixes)
+
+Ten confirmed blockers, each fixed at the trust boundary (database, server
+route, or canonical service) — not by hiding UI:
+
+| # | Root cause | Fix |
+|---|---|---|
+| 1 | OAuth `state` carried a sealed blob (sensitive data adjacent to the URL) and no PKCE | State is now an opaque single-use random nonce; the full binding (user, provider, redirect, PKCE verifier, session token, iat/exp) lives in an AES-256-GCM HttpOnly/Secure/SameSite cookie scoped to `/api/google`; constant-time nonce check, closed provider enum, generic error redirects, `no-store` headers, cookie cleared on every callback (`lib/server/oauthState.ts`) |
+| 2 | Asset generation gated only the primary achievement; sanitized text was appended, not substituted | One canonical source-resolution service (`lib/sourceGraph.ts`) resolves achievements + metrics + evidence + claims + archetype via junction tables, classifies each source by its own rules, REPLACES private text with the approved claim, and builds a deterministic payload manifest; the suite inspects the exact serialized outbound payload |
+| 3 | Eligibility checked only at generation | `lib/assetService.ts` revalidates the full graph on generate / author / approve / collection-add / external-use, persists `eligibility_stale_bool` + reason, audits every attempt (including unavailable) to `ai_outputs` |
+| 4 | UUID-array relationships (no FK integrity) | Nine junction tables with `user_id` + composite same-user FKs to both parents + uniqueness + RLS; array columns dropped; version-chain triggers |
+| 5 | Offer acceptance enforced only on UPDATE; Gate 7 unlinked to an offer | Trigger runs on INSERT + UPDATE and requires `attorney_reviewed_doc_ref`; Gate 7 must reference the specific qualifying offer (`qualifying_offer_fk`, same-user FK) and regresses if that offer disappears |
+| 6 | Maturity enforced by hiding UI; override could be set silently | Database-authoritative: `ccc_recompute_maturity` (corrected v2.1 §15 semantics) persists client-read-only `maturity_state`; P1 write policies check it inside RLS; `ccc_set_override` demands a reason and logs every change; override-era mutations audited to `override_mutations` |
+| 7 | Vault stripped the status filter before matching; keyboard not wired to the hierarchy | Status filter passes through; J/K/E/⌘↵/⌘⇧A/Esc operate on the flattened canonical hierarchy with the real promotion gate behind ⌘↵; browser checks added |
+| 8 | Integration script only asserted route titles | Deterministic end-to-end flows for all modules, real Supabase (no interception), stub transport AFTER the real gate, cleanup, artifacts |
+| 9 | Regression gaps | 39 new behavioral tests (OAuth state, exact payload, lifecycle, version chain, offers/Gate 7, DB maturity + bypass + audit, filters) |
+| 10 | PR/report claims drifted from the code | This document and the PR body rewritten to the verified state only |
+
 ## Stack
 
 Next.js 15 (App Router, TS, Tailwind; client data layer over
@@ -40,7 +58,7 @@ vendored from npm.
 
 ## Schema
 
-Two-migration chain, applied identically to the remote project and loaded
+Four-migration chain, applied identically to the remote project and loaded
 verbatim by the hermetic suite (drift breaks tests):
 
 1. `20260730000100_p0a_canonical_schema.sql` — the four canonical entities.
@@ -51,17 +69,37 @@ verbatim by the hermetic suite (drift breaks tests):
    contacts, applications, outreach, referrals, interviews, comp_benchmarks,
    offers, offer_scenarios, counter_proposals, skills, skill_evidence,
    skill_development_plans, skill_development_progress, "references",
-   google_connections, ingestion_runs, ingested_items, owner_overrides
-   (36 tables total).
+   google_connections, ingestion_runs, ingested_items, owner_overrides.
+3. `20260730010000_integrity_and_enforcement.sql` — release-blocker
+   corrections: nine normalized junction tables replacing every UUID-array
+   relationship (asset_source_achievements / _evidence / _metrics,
+   collection_assets, story_achievements, story_archetypes, plan_archetypes,
+   reference_application_uses, counter_benchmarks — each with `user_id`,
+   composite same-user FKs to BOTH parents, uniqueness, RLS), version-chain
+   triggers, offer acceptance on INSERT + UPDATE, Gate 7 ⇢ specific
+   qualifying offer (`qualifying_offer_fk`), database-authoritative maturity
+   (`maturity_state`, `override_mutations`, `ccc_recompute_maturity`,
+   `ccc_set_override`, P1 write policies gated on `ccc_p1_unlocked`).
+4. `20260730020000_enforcement_corrections.sql` — defects the hermetic suite
+   found running the full chain from empty: `date - bigint` cast, composite
+   SET NULL column list, Gate-7 regression when its offer disappears,
+   unreachable acceptance branch folded, override-audit NULL guard.
 
-Every table: `user_id` default `auth.uid()`, RLS select/insert/update/delete
-scoped to the user, and **composite same-user foreign keys** — a child row's
+47 public tables. Every table: `user_id` default `auth.uid()`, RLS scoped to
+the user, and **composite same-user foreign keys** — a child row's
 `(fk, user_id)` must match a parent owned by the same user, so cross-user
 linking fails in the database, not in application code. Enforcement objects:
 sanitized-claim approval ⇒ PUBLIC_SAFE (check), attorney-gated visa states
 (check), one current resume/profile collection (partial unique index),
-offer-acceptance Gate-7 trigger, `has_metric_bool` sync trigger. All `ccc_*`
-functions are invoker-rights (no SECURITY DEFINER).
+offer-acceptance + Gate-7 triggers (insert AND update), version-chain
+triggers (same-asset current version, no cross-asset or backward
+supersession), reference-willingness trigger, `has_metric_bool` sync
+trigger. `ccc_*` functions are invoker-rights except five justified
+SECURITY DEFINER functions (`ccc_set_override`, `ccc_override_active`,
+`ccc_p1_unlocked`, `ccc_recompute_maturity`, `ccc_log_override_mutation`)
+that must write the client-read-only maturity/override tables; each pins
+`search_path` and is scoped to `auth.uid()`. The schema test enforces this
+exact allowlist.
 
 ## Security remediation (from the correction mandate)
 
@@ -74,8 +112,10 @@ functions are invoker-rights (no SECURITY DEFINER).
 3. Branch history **rewritten**: the PR branch now contains no commit with
    the old credentials (single clean commit atop `main`). GitHub may retain
    orphaned commits by SHA — which is why rotation was done regardless.
-4. `SECURITY DEFINER` removed from the updated-at trigger function (all
-   functions invoker-rights; schema test enforces this).
+4. `SECURITY DEFINER` removed from the updated-at trigger function; the only
+   definers are the five maturity/override functions that must write
+   client-read-only tables (schema test enforces the exact allowlist and
+   pinned search_path).
 5. Same-user relational integrity via composite FKs on all 25+ relationships
    (tested: cross-user project/achievement/metric/evidence linking fails).
 6. Public sign-up removed from the login surface; owner bootstrap documented
@@ -93,6 +133,8 @@ functions are invoker-rights (no SECURITY DEFINER).
 | 4 | Apply `p0a_canonical_schema` | success |
 | 5 | Create rotated CI users (pre-confirmed) | `ci-a@career-cc-tests.example.com`, `ci-b@…` |
 | 6 | Apply `full_product_schema` | success (36 public tables) |
+| 7 | Apply `integrity_and_enforcement` (junctions, triggers, maturity) | success (47 public tables) |
+| 8 | Apply `enforcement_corrections` (fixes found by the hermetic chain) | success |
 
 Travel and Finance Supabase projects were not touched at any point.
 (Housekeeping note from the previous iteration remains: the paused travel
@@ -102,32 +144,43 @@ project existed; drop SQL is in the PR discussion. Pre-existing advisory:
 
 ## Verification evidence
 
-### Automated suites — 66 passing
+### Automated suites — 105 passing
 
 ```
 behavior suite backend: pglite (hermetic, real migrations + RLS)
 
- ✓ tests/crud.test.ts (26 tests) 16785ms
- ✓ tests/model.test.ts (24 tests) 25ms
- ✓ tests/schema.test.ts (16 tests) 12725ms
+ ✓ tests/model.test.ts       (24 tests)
+ ✓ tests/filters.test.ts      (7 tests)
+ ✓ tests/oauthState.test.ts  (14 tests)
+ ✓ tests/schema.test.ts      (16 tests)
+ ✓ tests/assetSafety.test.ts (14 tests)
+ ✓ tests/crud.test.ts        (30 tests)
 
- Test Files  3 passed (3)
-      Tests  66 passed (66)
+ Test Files  6 passed (6)
+      Tests  105 passed (105)
 ```
 
-Coverage map against the test contract: canonical schema/constraints ✓ ·
-RLS + cross-user isolation ✓ · archive/restore ✓ · hierarchy/persistence ✓ ·
-truth/privacy gates + PRIVATE exclusion ✓ · sanitization approval ✓ · grader
-rubric + director threshold + ceilings ✓ · archetype approval + JD retention ✓
-· comparator output ✓ · asset blocking/collections ✓ · visa dependencies +
-market-motion gating ✓ · weekly workflows ✓ · maturity calculation + logged
-override ✓ · P1 lock behavior ✓ · offers Gate-7 acceptance block ✓ ·
-reference willingness enforcement ✓ · quick-log defaults ✓ · no product
+Coverage map against the test contract: full migration chain from an empty
+database (47 tables) ✓ · canonical schema/constraints ✓ · RLS + cross-user
+isolation (including junction tables) ✓ · archive/restore ✓ ·
+hierarchy/persistence ✓ · OAuth state security (no sensitive data in
+state/URL, tamper/expiry/replay/nonce/provider/key-rotation rejection,
+cookie flags) ✓ · EXACT outbound AI payload via deterministic capturing
+transport (sanitized claim REPLACES private text; zero transport calls when
+blocked) ✓ · asset lifecycle revalidation + staleness + audit ✓ ·
+version-chain integrity (DB triggers) ✓ · sanitization approval ✓ · grader
+rubric + director threshold + ceilings ✓ · archetype approval + JD retention
+✓ · comparator output ✓ · visa dependencies + market-motion gating ✓ ·
+weekly workflows ✓ · maturity computed IN the database + direct P1 bypass
+rejected at RLS + override reason/logging/audit ✓ · offer acceptance on
+INSERT and UPDATE + Gate-7 specific-offer relationship ✓ · reference
+willingness via junction ✓ · vault filter combinations (status never
+stripped) ✓ · quick-log defaults ✓ · no product
 delete/export/PDF/LinkedIn-automation code ✓ · spoofed user_id ✓.
 
 ### Build
 
-`next build` clean — 27 routes.
+`next build` clean — 30 routes.
 
 ### Visual proof
 
@@ -139,11 +192,21 @@ decorative color. See `docs/validation/README.md`.
 
 ### Real integration (no interception)
 
-`scripts/integration-live.mjs` + `integration.yml` — full real-browser flow
-against the live project. **Gated on GitHub Secrets the owner must add**
-(the build environment can neither write GitHub secrets nor reach
-supabase.co through its egress policy). Fails closed until then; the run
-link becomes the final evidence once dispatched.
+`scripts/integration-live.mjs` + `integration.yml` (dispatch + push) — real
+sign-in through the auth UI against the live Supabase project, then
+deterministic end-to-end flows across the modules: vault capture → metrics /
+evidence → promotion gate → archive/restore → **keyboard on the canonical
+hierarchy (J/K/E, ⌘↵ promotion gate, ⌘⇧A archive, Esc)** → **filter
+combinations** → P1 blocked at the database while locked → owner override
+via settings (reason prompted, logged) → offer + Gate-7 qualifying-offer
+acceptance → STAR story approval → archetype → asset generation blocked by
+the truth gate, then generated through the stub transport
+(`CCC_AI_TRANSPORT=stub`, applied AFTER the real gate), approved, external
+use logged → Sunday Review brief → reference willingness enforcement.
+Screenshots uploaded as run artifacts; cleanup runs afterwards (test
+tooling; the product itself never deletes). **Gated on GitHub Secrets the
+owner must add** (`CCC_TEST_EMAIL_A`, `CCC_TEST_PASSWORD`); fails closed
+without them — the run id becomes the final evidence once secrets exist.
 
 ## Honest status classification
 

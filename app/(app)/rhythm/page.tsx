@@ -6,7 +6,8 @@ import { StatusBadge } from "@/components/Badges";
 import PageHeader from "@/components/PageHeader";
 import QuickLogBar from "@/components/QuickLogBar";
 import { useShell } from "@/components/ShellContext";
-import { createRow, listRows, updateRow } from "@/lib/genericRepo";
+import { listRows, updateRow } from "@/lib/genericRepo";
+import { setOverride } from "@/lib/maturity";
 import { useVaultData } from "@/lib/hooks";
 import { listDraftAchievements } from "@/lib/repos";
 import {
@@ -79,11 +80,7 @@ export default function RhythmPage() {
           "Type a reason to override — the override is logged.",
       );
       if (!reason) return;
-      await createRow(db, "owner_overrides", {
-        override_key: "market_motion_override",
-        enabled_bool: true,
-        reason: `${a.title}: ${reason}`,
-      });
+      await setOverride(db, "market_motion_override", true, `${a.title}: ${reason}`);
     }
     if (selectedCount >= 3 && a.status === "candidate") {
       setNotice("Top 3 already selected — drop one before adding another.");

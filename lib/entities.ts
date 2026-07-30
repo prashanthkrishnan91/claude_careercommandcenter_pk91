@@ -98,13 +98,13 @@ export interface CareerAsset {
   user_id: string;
   asset_type: AssetType;
   current_version_fk: string | null;
-  source_achievement_refs: string[];
-  source_evidence_refs: string[];
   target_archetype_fk: string | null;
   truth_status_summary: string;
   privacy_class: PrivacyClass;
   used_externally_bool: boolean;
   external_use_log: Array<{ at: string; destination: string; version: number }>;
+  eligibility_stale_bool: boolean;
+  eligibility_reason: string;
   status: "active" | "archived";
   created_at: string;
   updated_at: string;
@@ -131,10 +131,11 @@ export interface AssetCollection {
   user_id: string;
   name: string;
   collection_type: "resume_version" | "interview_pack" | "li_profile_draft" | "promotion_packet";
-  asset_refs: string[];
   target_archetype_fk: string | null;
   notes: string;
   current_bool: boolean;
+  approved_by_user_bool: boolean;
+  approved_at: string | null;
   status: "active" | "archived";
   created_at: string;
   updated_at: string;
@@ -156,8 +157,8 @@ export interface StoryBankEntry {
   task: string;
   action: string;
   result: string;
-  source_achievement_refs: string[];
-  target_archetype_refs: string[];
+  approved_by_user_bool: boolean;
+  approved_at: string | null;
   freshness_score: number | null;
   last_practiced_at: string | null;
   status: "active" | "archived";
@@ -178,6 +179,7 @@ export interface VisaChecklistItem {
   attorney_confirmed_at: string | null;
   attorney_confirmation_doc_ref: string;
   do_not_act_until_confirmed_bool: boolean;
+  qualifying_offer_fk: string | null;
   notes: string;
   created_at: string;
   updated_at: string;
@@ -390,7 +392,6 @@ export interface CounterProposal {
   offer_fk: string;
   proposed_changes: Array<{ field: string; ask: string; justification: string }>;
   rationale: string;
-  supporting_benchmark_refs: string[];
   sent_at: string | null;
   response_at: string | null;
   response_summary: string;
@@ -434,7 +435,6 @@ export interface SkillDevelopmentPlan {
   current_level_1_to_5: number | null;
   target_level_1_to_5: number | null;
   rationale: string;
-  target_archetype_refs: string[];
   method:
     | "work_project"
     | "side_project"
@@ -495,7 +495,6 @@ export interface ReferenceRecord {
   cadence_target_months: number | null;
   last_touch_date: string | null;
   next_touch_due: string | null;
-  used_for_application_refs: string[];
   notes: string;
   status: "active" | "archived";
   created_at: string;

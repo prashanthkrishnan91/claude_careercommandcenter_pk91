@@ -32,6 +32,13 @@ export async function POST(req: Request) {
   if (!achievementId) return NextResponse.json({ error: "achievementId required" }, { status: 400 });
 
   if (!aiConfigured()) {
+    // Unavailable attempts are persisted too — "every attempt is audited".
+    await createRow(db, "ai_outputs", {
+      output_type: "grader_evaluation",
+      input_refs: [{ kind: "achievement", id: achievementId }],
+      blocked_bool: true,
+      block_reason: "unavailable: ANTHROPIC_API_KEY is not configured",
+    });
     return NextResponse.json(
       { unavailable: true, message: "AI is not configured (ANTHROPIC_API_KEY absent). Grading is unavailable; nothing was generated." },
       { status: 503 },

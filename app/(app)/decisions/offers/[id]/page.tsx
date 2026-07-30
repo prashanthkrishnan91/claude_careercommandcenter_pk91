@@ -28,6 +28,7 @@ const OFFER_SPECS: FieldSpec[] = [
   { key: "equity_grant_value", label: "Equity grant value", kind: "number" },
   { key: "signing_bonus", label: "Signing bonus", kind: "number" },
   { key: "relocation_package", label: "Relocation", kind: "text" },
+  { key: "attorney_reviewed_doc_ref", label: "Attorney-reviewed doc ref", kind: "text", placeholder: "e.g. attorney-memo-2026-07.pdf" },
   { key: "bonus_structure_notes", label: "Bonus structure notes", kind: "textarea", span: 2 },
   { key: "equity_vest_schedule_notes", label: "Vest schedule notes", kind: "textarea", span: 2 },
   { key: "benefits_summary", label: "Benefits summary", kind: "textarea", span: 2 },
@@ -126,6 +127,21 @@ export default function OfferDetailPage() {
               Priority-date retention committed in writing
             </label>
             <div className="sm:col-span-2 flex flex-wrap items-center gap-3">
+              <button
+                className="btn"
+                title="Gate 7 must reference the specific qualifying offer"
+                onClick={async () => {
+                  const g7 = data!.gates.find((g) => g.ordinal === 7);
+                  if (!g7) return;
+                  const { error: err } = await db.from("visa_checklist_items").update({ qualifying_offer_fk: o.id }).eq("id", g7.id).select();
+                  if (err) setNotice(err.message);
+                  bump();
+                }}
+              >
+                {data.gates.find((g) => g.ordinal === 7)?.qualifying_offer_fk === o.id
+                  ? "✓ Gate-7 qualifying offer"
+                  : "Mark as Gate-7 qualifying offer"}
+              </button>
               <span className="microlabel">attorney review</span>
               {o.attorney_reviewed_at ? (
                 <span className="font-mono text-[11px] text-signal-green">reviewed {o.attorney_reviewed_at.slice(0, 10)}</span>
@@ -137,7 +153,7 @@ export default function OfferDetailPage() {
             </div>
           </div>
           <p className="mt-2 text-[11px] text-dim-500">
-            Acceptance requires all three above AND Visa Checklist Gate 7 complete ({gatesReady ? "gates 6+7 confirmed" : "gates 6/7 not yet confirmed"}).
+            Acceptance requires both commitments, attorney review with a document reference, AND Visa Gate 7 complete referencing this offer ({gatesReady ? "gates 6+7 confirmed" : "gates 6/7 not yet confirmed"}).
             The database enforces this independently of the UI. Not legal advice — your attorney interprets the terms.
           </p>
         </section>

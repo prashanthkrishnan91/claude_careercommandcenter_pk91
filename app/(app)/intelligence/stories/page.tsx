@@ -60,6 +60,19 @@ export default function StoryBankPage() {
               <span className="w-28 font-mono text-[10px] uppercase text-dim-400">{s.theme.replace("_", " ")}</span>
               <span className="min-w-0 flex-1 truncate text-[13px] text-dim-100">{s.situation.slice(0, 100) || "(untitled situation)"}</span>
               {s.last_practiced_at && <span className="font-mono text-[10px] text-dim-500">practiced {s.last_practiced_at.slice(0, 10)}</span>}
+              {s.approved_by_user_bool ? (
+                <span className="font-mono text-[10px] uppercase text-signal-green">approved</span>
+              ) : (
+                <button
+                  className="btn-quiet"
+                  onClick={(e) => {
+                    e.preventDefault();
+                    void updateRow(db, "story_bank", s.id, { approved_by_user_bool: true, approved_at: new Date().toISOString() }).then(bump);
+                  }}
+                >
+                  approve
+                </button>
+              )}
               <button
                 className="btn-quiet"
                 onClick={(e) => {

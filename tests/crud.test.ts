@@ -364,7 +364,16 @@ describe("P0F visa checklist + Offer Gate 7", () => {
     expect(good.error).toBeNull();
   });
 
+  it("P1 offer writes are rejected by the database until maturity or a logged override unlocks them", async () => {
+    const locked = await A.from("offers").insert({ role_title: "Too early" }).select();
+    expect(locked.error?.message).toMatch(/row-level security/);
+    await A.rpc("ccc_set_override", { p_key: "maturity_dev_override", p_enabled: true, p_reason: "test validation" });
+    const unlocked = await A.from("offers").insert({ role_title: "After override" }).select();
+    expect(unlocked.error).toBeNull();
+  });
+
   it("an offer cannot be accepted while Gate 7 is incomplete (DB trigger)", async () => {
+    await A.rpc("ccc_set_override", { p_key: "maturity_dev_override", p_enabled: true, p_reason: "test validation" });
     await ensureVisaChecklist(A);
     const offer = await createRow<Offer>(A, "offers", {
       role_title: "Director, Analytics",
@@ -372,56 +381,106 @@ describe("P0F visa checklist + Offer Gate 7", () => {
       visa_sponsorship_committed_bool: true,
       priority_date_retention_committed_bool: true,
       attorney_reviewed_at: new Date().toISOString(),
+      attorney_reviewed_doc_ref: "attorney-memo-2026-07-30.pdf",
     });
     const blocked = await A.from("offers").update({ status: "accepted" }).eq("id", offer.id).select();
     expect(blocked.error?.message).toMatch(/Gate 7/);
     const gates = await listRows<VisaChecklistItem>(A, "visa_checklist_items", { includeArchived: true });
+    // Gate 7 refuses to complete without a specific qualifying offer…
+    const g7 = gates.find((g) => g.ordinal === 7)!;
+    const g7bare = await A.from("visa_checklist_items")
+      .update({ status: "complete", attorney_confirmed_at: new Date().toISOString() })
+      .eq("id", g7.id).select();
+    expect(g7bare.error?.message).toMatch(/qualifying offer/);
+    // …and completes once it references THIS offer.
     for (const g of gates.filter((g) => g.ordinal <= 7)) {
       await updateRow(A, "visa_checklist_items", g.id, {
         status: "complete",
         attorney_confirmed_at: g.attorney_confirmation_required_bool ? new Date().toISOString() : null,
+        ...(g.ordinal === 7 ? { qualifying_offer_fk: offer.id } : {}),
       });
     }
     const accepted = await A.from("offers").update({ status: "accepted" }).eq("id", offer.id).select();
     expect(accepted.error).toBeNull();
+    // acceptance is enforced on UPDATE of an accepted row too: commitments
+    // cannot be silently withdrawn afterwards.
+    const stripped = await A.from("offers")
+      .update({ visa_sponsorship_committed_bool: false }).eq("id", offer.id).select();
+    expect(stripped.error?.message).toMatch(/sponsorship/);
+  });
+
+  it("acceptance is enforced on INSERT as well as UPDATE", async () => {
+    await A.rpc("ccc_set_override", { p_key: "maturity_dev_override", p_enabled: true, p_reason: "test validation" });
+    await ensureVisaChecklist(A);
+    const inserted = await A.from("offers")
+      .insert({ role_title: "Pre-accepted smuggle", status: "accepted" })
+      .select();
+    expect(inserted.error?.message).toMatch(/sponsorship|attorney|Gate 7/i);
   });
 
   it("an offer missing sponsorship commitments cannot be accepted even at Gate 7", async () => {
+    await A.rpc("ccc_set_override", { p_key: "maturity_dev_override", p_enabled: true, p_reason: "test validation" });
     const gates = await ensureVisaChecklist(A);
+    // Complete Gate 7 against a fully qualified offer…
+    const qualifying = await createRow<Offer>(A, "offers", {
+      role_title: "Qualified",
+      status: "negotiating",
+      visa_sponsorship_committed_bool: true,
+      priority_date_retention_committed_bool: true,
+      attorney_reviewed_at: new Date().toISOString(),
+      attorney_reviewed_doc_ref: "attorney-memo.pdf",
+    });
     for (const g of gates.filter((g) => g.ordinal <= 7)) {
       await updateRow(A, "visa_checklist_items", g.id, {
         status: "complete",
         attorney_confirmed_at: g.attorney_confirmation_required_bool ? new Date().toISOString() : null,
+        ...(g.ordinal === 7 ? { qualifying_offer_fk: qualifying.id } : {}),
       });
     }
+    // …a different offer without commitments still cannot be accepted.
     const offer = await createRow<Offer>(A, "offers", { role_title: "Dir", status: "received" });
     const blocked = await A.from("offers").update({ status: "accepted" }).eq("id", offer.id).select();
     expect(blocked.error?.message).toMatch(/sponsorship|attorney/i);
   });
+
+  it("Gate 7 cannot reference an unqualified offer as qualifying", async () => {
+    await A.rpc("ccc_set_override", { p_key: "maturity_dev_override", p_enabled: true, p_reason: "test validation" });
+    const gates = await ensureVisaChecklist(A);
+    const weak = await createRow<Offer>(A, "offers", { role_title: "No commitments", status: "received" });
+    const g7 = gates.find((g) => g.ordinal === 7)!;
+    const res = await A.from("visa_checklist_items")
+      .update({ status: "complete", attorney_confirmed_at: new Date().toISOString(), qualifying_offer_fk: weak.id })
+      .eq("id", g7.id).select();
+    expect(res.error?.message).toMatch(/commitments and attorney review/);
+  });
 });
 
 describe("references overlay", () => {
-  it("cannot record application use until willingness is confirmed (DB constraint)", async () => {
+  it("cannot record application use until willingness is confirmed (junction + DB trigger)", async () => {
+    await A.rpc("ccc_set_override", { p_key: "maturity_dev_override", p_enabled: true, p_reason: "test validation" });
     const contact = await createRow<{ id: string }>(A, "contacts", { name: "Jordan Reeves" });
     const ref = await createRow<{ id: string }>(A, "references", {
       contact_fk: contact.id,
       reference_type: "manager",
     });
     const app = await createRow<{ id: string }>(A, "applications", { role_title: "Director, Analytics" });
-    const bad = await A.from("references")
-      .update({ used_for_application_refs: [app.id] })
-      .eq("id", ref.id)
+    const bad = await A.from("reference_application_uses")
+      .insert({ reference_fk: ref.id, application_fk: app.id })
       .select();
-    expect(bad.error).not.toBeNull();
+    expect(bad.error?.message).toMatch(/willingness/);
     await updateRow(A, "references", ref.id, {
       willingness_status: "confirmed",
       willingness_confirmed_at: new Date().toISOString(),
     });
-    const good = await A.from("references")
-      .update({ used_for_application_refs: [app.id] })
-      .eq("id", ref.id)
+    const good = await A.from("reference_application_uses")
+      .insert({ reference_fk: ref.id, application_fk: app.id })
       .select();
     expect(good.error).toBeNull();
+    // uniqueness: the same reference/application pair cannot be recorded twice
+    const dup = await A.from("reference_application_uses")
+      .insert({ reference_fk: ref.id, application_fk: app.id })
+      .select();
+    expect(dup.error).not.toBeNull();
   });
 });
 
@@ -440,7 +499,7 @@ describe("P0G rhythm + maturity gates", () => {
     expect(outward[0].title).toMatch(/brand-building/i);
   });
 
-  it("maturity gates compute from real data and honor the logged owner override", async () => {
+  it("maturity gates compute in the DATABASE from real data and honor the logged owner override", async () => {
     const locked = await computeMaturity(A);
     expect(locked.unlocked).toBe(false);
     expect(locked.criteria.find((c) => c.key === "achievements_15")?.met).toBe(false);
@@ -449,14 +508,40 @@ describe("P0G rhythm + maturity gates", () => {
     const withData = await computeMaturity(A);
     expect(withData.criteria.find((c) => c.key === "achievements_15")?.met).toBe(true);
     expect(withData.unlocked).toBe(false); // other gates still unmet
-    await createRow(A, "owner_overrides", {
-      override_key: "maturity_dev_override",
-      enabled_bool: true,
-      reason: "validation run",
+
+    // the override table is client-read-only: a direct write is rejected…
+    const direct = await A.from("owner_overrides")
+      .insert({ override_key: "maturity_dev_override", enabled_bool: true, reason: "sneaky" })
+      .select();
+    expect(direct.error?.message).toMatch(/row-level security/);
+    // …the RPC demands a reason…
+    const noReason = await A.rpc("ccc_set_override", {
+      p_key: "maturity_dev_override", p_enabled: true, p_reason: "  ",
     });
+    expect(noReason.error?.message).toMatch(/reason/);
+    // …and the legitimate path works and is logged.
+    const ok = await A.rpc("ccc_set_override", {
+      p_key: "maturity_dev_override", p_enabled: true, p_reason: "validation run",
+    });
+    expect(ok.error).toBeNull();
     const overridden = await computeMaturity(A);
     expect(overridden.overrideActive).toBe(true);
     expect(overridden.unlocked).toBe(true);
     expect(overridden.allMet).toBe(false); // override never fabricates criteria
+    const log = await A.from("owner_overrides").select("*");
+    expect((log.data ?? []).some((r: { reason: string }) => r.reason === "validation run")).toBe(true);
+  });
+
+  it("P1 mutations made under an override (gates unmet) are audited to override_mutations", async () => {
+    await A.rpc("ccc_set_override", { p_key: "maturity_dev_override", p_enabled: true, p_reason: "test validation" });
+    const company = await createRow<{ id: string }>(A, "companies", { name: "Meridian Data" });
+    const rows = await A.from("override_mutations").select("*");
+    const audited = (rows.data ?? []) as Array<{ table_name: string; row_id: string; operation: string }>;
+    expect(audited.some((r) => r.table_name === "companies" && r.row_id === company.id && r.operation === "INSERT")).toBe(true);
+    // the audit table itself is client-read-only
+    const forge = await A.from("override_mutations")
+      .insert({ table_name: "companies", operation: "INSERT" })
+      .select();
+    expect(forge.error).not.toBeNull();
   });
 });

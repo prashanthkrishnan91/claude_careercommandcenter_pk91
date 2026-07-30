@@ -5,7 +5,8 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import PageHeader from "@/components/PageHeader";
 import { useShell } from "@/components/ShellContext";
 import { postApi } from "@/lib/apiClient";
-import { createRow, listRows } from "@/lib/genericRepo";
+import { listRows } from "@/lib/genericRepo";
+import { setOverride } from "@/lib/maturity";
 import { useVaultData } from "@/lib/hooks";
 import { DEFAULT_SETTINGS, loadSettings, saveSettings, type UserSettings } from "@/lib/settings";
 import { getSupabase } from "@/lib/supabase";
@@ -170,11 +171,11 @@ export default function SettingsPage() {
               onClick={async () => {
                 const reason = window.prompt(overrideOn ? "Reason for disabling (logged):" : "Reason for enabling (logged):");
                 if (reason === null) return;
-                await createRow(db, "owner_overrides", {
-                  override_key: "maturity_dev_override",
-                  enabled_bool: !overrideOn,
-                  reason,
-                });
+                try {
+                  await setOverride(db, "maturity_dev_override", !overrideOn, reason);
+                } catch (e) {
+                  window.alert(e instanceof Error ? e.message : "override change failed");
+                }
                 bump();
               }}
             >
