@@ -1,5 +1,6 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import type { AssetVersion, CareerAsset } from "./entities";
+import { postApi } from "./apiClient";
 import { createRow } from "./genericRepo";
 import { classifications, gateGraph, resolveSourceGraph, type GraphGate, type SourceGraph } from "./sourceGraph";
 
@@ -72,45 +73,22 @@ export async function revalidateAsset(
   return { graph, gate };
 }
 
-/** Transactional version commit: lock → allocate → insert → supersede → repoint. */
-export async function commitVersion(
-  db: SupabaseClient,
-  asset: CareerAsset,
-  values: Partial<AssetVersion> & { content?: string },
-  derivedPrivacy: string | null,
-  truthSummary: string,
-  ack = false,
-): Promise<AssetVersion> {
-  const { data, error } = await db.rpc("ccc_commit_asset_version", {
-    p_asset: asset.id,
-    p_content: values.content ?? "",
-    p_model: values.generated_by_model ?? "",
-    p_prompt_hash: values.generation_prompt_hash ?? "",
-    p_blocked: values.blocked_bool ?? false,
-    p_block_reason: values.block_reason ?? "",
-    p_privacy: derivedPrivacy,
-    p_truth_summary: truthSummary,
-    p_ack: ack,
-  });
-  if (error) throw new Error(error.message);
-  return data as AssetVersion;
-}
-
-export async function authorManualVersion(db: SupabaseClient, assetId: string, content: string): Promise<AssetVersion> {
-  const { graph, gate } = await revalidateAsset(db, assetId);
-  const truthSummary = [...new Set(graph.sources.map((s) => s.truth_status).filter(Boolean))].join(",");
-  // A dedicated RPC: it commits transactionally like generation, and records
-  // the version as hand-authored — model and prompt metadata are not
-  // caller-supplied and cannot be forged.
-  const { data, error } = await db.rpc("ccc_author_manual_version", {
-    p_asset: assetId,
-    p_content: content,
-    p_privacy: gate.allowed ? "PUBLIC_SAFE" : null,
-    p_truth_summary: truthSummary,
-  });
-  if (error) throw new Error(error.message);
-  await audit(db, graph, `asset_${graph.asset.asset_type}_manual`, { blocked: false, output: content });
-  return data as AssetVersion;
+/**
+ * Manual authoring goes through a PROTECTED SERVER ROUTE. The browser submits
+ * only the asset id and the content it typed; privacy, truth summary, model
+ * metadata, prompt hash, blocking, supersession and current-version are all
+ * derived server-side, and the low-level commit function is not executable by
+ * any browser role.
+ */
+export async function authorManualVersion(assetId: string, content: string): Promise<AssetVersion> {
+  const res = await postApi<{ version?: AssetVersion; error?: string; message?: string }>(
+    "/api/assets/manual-version",
+    { assetId, content },
+  );
+  if (res.status !== 200 || !res.json.version) {
+    throw new Error(res.json.message ?? res.json.error ?? "authoring failed");
+  }
+  return res.json.version;
 }
 
 function gateErrorFrom(message: string, verdict?: DbVerdict): never {

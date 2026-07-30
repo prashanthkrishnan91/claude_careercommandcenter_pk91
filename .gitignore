@@ -22,3 +22,7 @@ npm-debug.log*
 
 # test artifacts
 /test-results/
+
+# never commit real env values
+.env
+.env.local

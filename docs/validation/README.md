@@ -1,8 +1,8 @@
 # Validation report
 
-## 1. Automated suites — 156 tests (run in this repo, output in BUILD_REPORT.md)
+## 1. Automated suites — 165 tests (run in this repo, output in BUILD_REPORT.md)
 
-- `tests/schema.test.ts` — fresh 6-migration chain applies from an empty
+- `tests/schema.test.ts` — fresh 7-migration chain applies from an empty
   database (49 tables); exact canonical columns/enums/defaults; substituted
   values (`EVIDENCED`, `SENSITIVE`, `EXTERNAL_OK`, `COMPLETED`) rejected;
   composite same-user FKs on every relationship including all nine junction
@@ -50,8 +50,16 @@
   delete all match nothing, with the column guards still firing on a privileged
   path); membership validated on UPDATE and rejecting a version filed under the
   wrong asset; an emptied approved/current collection demoted; a locked DELETE
-  rejected on every one of the twelve P1 tables; and the maturity/override
-  predicates refusing to report on another user.
+  rejected on every one of the twelve P1 tables; the maturity/override
+  predicates refusing to report on another user; and — the version-commit
+  authority — no browser role holding EXECUTE on any low-level lifecycle
+  function, an authenticated client denied the low-level commit, `anon`
+  denied, a service-role call unable to commit to another user's asset, a
+  commit without an audit refused outright, every generated version carrying a
+  matching audit while blocked and unavailable attempts still audit, privacy
+  and truth absent from the commit signature entirely, a manual version on an
+  ineligible graph saving but staying non-external and non-approved, and a
+  direct asset INSERT unable to fabricate any derived field.
 - `tests/integrationContract.test.ts` — executes the SAME dataset module the
   browser certification runs (`scripts/integration-dataset.mjs`) against the
   full migration chain, so a nonexistent column, an invalid enum, a missing

@@ -80,6 +80,23 @@ The prior pass guarded specific COLUMNS but left whole OPERATIONS open.
 | 7 | A schema mismatch could only be discovered during a live run | The dataset lives in `scripts/integration-dataset.mjs` and is executed TWICE: by the browser certification and by `tests/integrationContract.test.ts` against the full PGlite chain. The hermetic gate now fails on a bad column, invalid enum, missing required field or violated constraint — plus a structural scan that checks every column the module names against `information_schema`. |
 | 8 | *(found by the new gate)* Fifteen composite `ON DELETE SET NULL` constraints nulled `user_id` too, so deleting any parent raised a not-null violation | Each restricted to its own foreign-key column. |
 
+## Version-commit authority pass (fourth semantic review)
+
+`asset_versions` was locked, but the low-level `ccc_commit_asset_version` RPC
+was still executable by `authenticated` — so a browser could commit a version
+with caller-supplied content, model name, prompt hash, privacy and truth, make
+it current, and never touch the AI route or its audit. The table was locked;
+the door beside it was not. `20260730050000_server_only_commit.sql` closes it:
+
+| # | Correction |
+|---|---|
+| 1 | `ccc_commit_asset_version`, `ccc_author_manual_version`, `ccc_record_ai_audit`, `ccc_asset_graph_eligible_for` and `ccc_truth_summary` are revoked from PUBLIC, `anon` and `authenticated`, and granted only to `service_role`. Not a rename: the old signature is DROPPED. |
+| 2 | A server-only service-role client (`lib/server/supabaseAdmin.ts`, `import "server-only"`) reads `SUPABASE_SERVICE_ROLE_KEY` — no `NEXT_PUBLIC_` name, no committed fallback. Routes authenticate the caller with the user-bound client, resolve the user id server-side, and pass it to the database function, which enforces it and locks only that user's asset. A service-role call to another user's asset fails. |
+| 3 | Generation is reachable only via `/api/ai/generate-asset`: authenticate → gate the graph → build the payload → call the model or test transport → commit through the server-only function → audit. Model name and prompt hash come from this server's own call; privacy and truth are derived in the database. The audit is written IN THE SAME TRANSACTION, so a version presented as model-generated cannot exist without it, and a commit carrying no audit is refused. |
+| 4 | Manual authoring moves to `/api/assets/manual-version`, which accepts only an asset id and content. Privacy, truth, model metadata, prompt hash, blocking, supersession and current-version are all derived. A manual version on an ineligible graph is saved but stays non-PUBLIC_SAFE, unapprovable, unpackageable and visibly stale, and is audited as user-authored. |
+| 5 | `career_assets` derived fields are forced to canonical defaults on INSERT, so a new asset cannot arrive PUBLIC_SAFE, externally used, eligible, or pointing at an arbitrary current version. |
+| 6 | The shared integration dataset no longer calls the low-level RPC as a browser user. It takes an injected `createVersion` adapter: the browser certification posts to the protected API, the hermetic suite uses a privileged `service_role` harness. Its bypass matrix now also asserts the low-level RPCs are denied. |
+
 ## Stack
 
 Next.js 15 (App Router, TS, Tailwind; client data layer over
@@ -92,7 +109,7 @@ vendored from npm.
 
 ## Schema
 
-Six-migration chain, applied identically to the remote project and loaded
+Seven-migration chain, applied identically to the remote project and loaded
 verbatim by the hermetic suite (drift breaks tests):
 
 1. `20260730000100_p0a_canonical_schema.sql` — the four canonical entities.
@@ -135,6 +152,13 @@ verbatim by the hermetic suite (drift breaks tests):
    invalid or empty; P1 DELETE gated on maturity; the maturity/override
    predicates made parameterless; and the 15 remaining composite
    `ON DELETE SET NULL` constraints scoped to their own column.
+7. `20260730050000_server_only_commit.sql` — the low-level commit,
+   manual-author, audit-record, explicit-user graph gate and truth-summary
+   functions are revoked from PUBLIC, `anon` and `authenticated` and granted
+   only to `service_role`; the commit is re-signed to take the acting user
+   explicitly, derives privacy and truth itself, and writes the `ai_outputs`
+   audit row in the same transaction; `career_assets` derived fields are forced
+   to canonical defaults on INSERT.
 
 49 public tables. Every table: `user_id` default `auth.uid()`, RLS scoped to
 the user, and **composite same-user foreign keys** — a child row's
@@ -197,7 +221,7 @@ project existed; drop SQL is in the PR discussion. Pre-existing advisory:
 
 ## Verification evidence
 
-### Automated suites — 156 passing
+### Automated suites — 165 passing
 
 ```
 behavior suite backend: pglite (hermetic, real migrations + RLS)
@@ -208,11 +232,11 @@ behavior suite backend: pglite (hermetic, real migrations + RLS)
  ✓ tests/schema.test.ts                 (16 tests)
  ✓ tests/assetSafety.test.ts            (14 tests)
  ✓ tests/crud.test.ts                   (30 tests)
- ✓ tests/authoritativeBoundaries.test.ts (37 tests)
+ ✓ tests/authoritativeBoundaries.test.ts (46 tests)
  ✓ tests/integrationContract.test.ts     (14 tests)
 
  Test Files  8 passed (8)
-      Tests  156 passed (156)
+      Tests  165 passed (165)
 ```
 
 Coverage map against the test contract: full migration chain from an empty

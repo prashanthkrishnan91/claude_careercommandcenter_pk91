@@ -572,9 +572,39 @@ try {
   });
 
   await check(page, "collection-version-exact-approve-current-then-invalidated", async () => {
+    // Versions are created through the PROTECTED APPLICATION API — the
+    // low-level commit RPC is revoked from every browser role, so this is the
+    // only path a client has.
+    const createVersionViaApi = async (assetId) => {
+      const db = await signedClient();
+      try {
+        const token = (await db.auth.getSession()).data.session.access_token;
+        const res = await fetch(`${BASE}/api/assets/manual-version`, {
+          method: "POST",
+          headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+          body: JSON.stringify({
+            assetId,
+            content: "Cut churn forecast error 18% across a 3-team rebuild.",
+            // deliberately included and expected to be IGNORED by the route
+            privacy_class: "PUBLIC_SAFE",
+            truth_status_summary: "VERIFIED,forged",
+            generated_by_model: "gpt-fake",
+          }),
+        });
+        const body = await res.json();
+        if (!res.ok || !body.version) throw new Error(`manual-version route: ${body.error ?? res.status}`);
+        if (body.version.generated_by_model !== "") {
+          throw new Error("the route accepted browser-supplied model metadata");
+        }
+        return body.version;
+      } finally {
+        await db.auth.signOut();
+      }
+    };
     liveIds = await withDb(async (db) => {
       const { version, collection } = await collectionWorkflow(db, {
         assetId: liveIds.assetId, achievementId: liveIds.achievementId,
+        createVersion: createVersionViaApi,
       });
       return { ...liveIds, versionId: version.id, collectionId: collection.id };
     });
@@ -584,7 +614,10 @@ try {
 
   await check(page, "direct-postgrest-bypass-attempts-are-refused", async () => {
     const refusals = await withDb((db) => bypassAttempts(db, liveIds));
-    if (refusals.length < 9) throw new Error(`expected the full bypass matrix, got ${refusals.length}`);
+    if (refusals.length < 13) throw new Error(`expected the full bypass matrix, got ${refusals.length}`);
+    if (!refusals.includes("call ccc_commit_asset_version as an authenticated browser client")) {
+      throw new Error("the low-level commit RPC was reachable by a browser client");
+    }
   });
 
   await check(page, "p1-company-contact-outreach-referral-application-interview-debrief", async () => {

@@ -12,6 +12,8 @@ export interface TestUserCtx {
 }
 
 export interface TestBackend {
+  /** Privileged `service_role` adapter (hermetic backend only). */
+  serviceClient?: SupabaseClient;
   name: string;
   userA: TestUserCtx;
   userB: TestUserCtx;

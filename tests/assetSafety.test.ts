@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { createBackend, type TestBackend } from "./backends";
+import { setAdminClientForTests } from "../lib/server/supabaseAdmin";
 import {
   addVersionToCollection,
   approveCollection,
@@ -12,7 +13,7 @@ import {
   revalidateAsset,
   setCurrentCollection,
 } from "../lib/assetService";
-import { generateAssetVersion } from "../lib/server/assetGeneration";
+import { authorManualVersionServer, generateAssetVersion } from "../lib/server/assetGeneration";
 import { buildPayloadManifest, gateGraph, resolveSourceGraph } from "../lib/sourceGraph";
 import { createRow, getRow, listRows, updateRow } from "../lib/genericRepo";
 import {
@@ -38,9 +39,13 @@ beforeAll(async () => {
   backend = await createBackend();
   A = backend.userA.db;
   B = backend.userB.db;
+  // The server-only commit runs through the privileged adapter, exactly as the
+  // production route runs it through the service-role key.
+  setAdminClientForTests(backend.serviceClient!);
   await backend.cleanup();
 });
 afterAll(async () => {
+  setAdminClientForTests(null);
   await backend.cleanup();
   await backend.teardown();
 });
@@ -121,7 +126,7 @@ describe("blocker #2 — exact outbound payload through the canonical source gra
   it("the serialized payload contains eligible text and the sanitized claim REPLACES private text", async () => {
     const { asset } = await seedEligibleAsset(A);
     const { transport, calls } = capturingTransport();
-    const res = await generateAssetVersion(A, asset.id, { transport });
+    const res = await generateAssetVersion(A, backend.userA.userId, asset.id, { transport });
     expect(res.version).toBeDefined();
     expect(calls).toHaveLength(1);
     const payload = calls[0].system + "\n" + calls[0].user;
@@ -152,7 +157,7 @@ describe("blocker #2 — exact outbound payload through the canonical source gra
     const { asset, pub } = await seedEligibleAsset(A);
     await updateAchievement(A, pub.id, { truth_status: "NEEDS_PROOF" });
     const { transport, calls } = capturingTransport();
-    const res = await generateAssetVersion(A, asset.id, { transport });
+    const res = await generateAssetVersion(A, backend.userA.userId, asset.id, { transport });
     expect(res.blocked).toBeDefined();
     expect(calls).toHaveLength(0); // nothing left the building
     expect(res.blocked!.map((r) => r.label).join(" ")).toContain("Reduced churn forecast error");
@@ -190,10 +195,10 @@ describe("blocker #2 — exact outbound payload through the canonical source gra
     const { asset, pub } = await seedEligibleAsset(A);
     await updateAchievement(A, pub.id, { truth_status: "ATTESTED_NO_METRIC" });
     const { transport, calls } = capturingTransport();
-    const blocked = await generateAssetVersion(A, asset.id, { transport });
+    const blocked = await generateAssetVersion(A, backend.userA.userId, asset.id, { transport });
     expect(blocked.blocked?.some((r) => /override/.test(r.reason))).toBe(true);
     expect(calls).toHaveLength(0);
-    const ok = await generateAssetVersion(A, asset.id, { transport, attestedNoMetricOverride: true });
+    const ok = await generateAssetVersion(A, backend.userA.userId, asset.id, { transport, attestedNoMetricOverride: true });
     expect(ok.version).toBeDefined();
     expect(calls).toHaveLength(1);
   });
@@ -205,7 +210,7 @@ describe("blocker #2 — exact outbound payload through the canonical source gra
     delete process.env.CCC_AI_TRANSPORT;
     try {
       const { asset } = await seedEligibleAsset(A);
-      const res = await generateAssetVersion(A, asset.id, {});
+      const res = await generateAssetVersion(A, backend.userA.userId, asset.id, {});
       expect(res.unavailable).toBe(true);
       const audits = await listRows<{ blocked_bool: boolean; block_reason: string }>(A, "ai_outputs", { includeArchived: true });
       expect(audits.some((a) => a.blocked_bool && /unavailable/.test(a.block_reason))).toBe(true);
@@ -220,7 +225,7 @@ describe("blocker #3 — safety enforced through the full asset lifecycle", () =
   it("a source turning ineligible AFTER generation marks the asset stale and blocks approve/use/collection", async () => {
     const { asset, pub } = await seedEligibleAsset(A);
     const { transport } = capturingTransport();
-    const gen = await generateAssetVersion(A, asset.id, { transport });
+    const gen = await generateAssetVersion(A, backend.userA.userId, asset.id, { transport });
     const versionId = gen.version!.id;
     // the world changes: the verified claim becomes DISPUTED
     await updateAchievement(A, pub.id, { truth_status: "DISPUTED" });
@@ -255,7 +260,7 @@ describe("blocker #3 — safety enforced through the full asset lifecycle", () =
     const { asset } = await seedEligibleAsset(A);
     const coll = await createRow<{ id: string }>(A, "asset_collections", { name: "Pack", collection_type: "interview_pack" });
     const { transport } = capturingTransport();
-    const gen = await generateAssetVersion(A, asset.id, { transport });
+    const gen = await generateAssetVersion(A, backend.userA.userId, asset.id, { transport });
     await expect(addVersionToCollection(A, coll.id, gen.version!.id)).rejects.toThrow(/approved version/);
     await approveVersion(A, gen.version!.id);
     await addVersionToCollection(A, coll.id, gen.version!.id);
@@ -268,7 +273,7 @@ describe("blocker #3 — safety enforced through the full asset lifecycle", () =
   it("manual authoring revalidates the graph and derives privacy from it — not from authorship", async () => {
     const { asset, pub } = await seedEligibleAsset(A);
     await updateAchievement(A, pub.id, { truth_status: "INFERRED" });
-    const v = await authorManualVersion(A, asset.id, "Hand-written bullet");
+    const v = await authorManualVersionServer(backend.userA.userId, asset.id, "Hand-written bullet");
     expect(v.content).toBe("Hand-written bullet");
     const a = await getRow<CareerAsset>(A, "career_assets", asset.id);
     expect(a?.eligibility_stale_bool).toBe(true); // graph is not clean → flagged
@@ -280,8 +285,8 @@ describe("blocker #4 — version-chain and junction integrity at the database", 
   it("generation builds an atomic chain: prior open version superseded, current repointed", async () => {
     const { asset } = await seedEligibleAsset(A);
     const { transport } = capturingTransport();
-    const v1 = (await generateAssetVersion(A, asset.id, { transport })).version!;
-    const v2 = (await generateAssetVersion(A, asset.id, { transport })).version!;
+    const v1 = (await generateAssetVersion(A, backend.userA.userId, asset.id, { transport })).version!;
+    const v2 = (await generateAssetVersion(A, backend.userA.userId, asset.id, { transport })).version!;
     expect(v2.version_number).toBe(v1.version_number + 1);
     const rows = await listRows<AssetVersion>(A, "asset_versions", { eq: { asset_fk: asset.id }, includeArchived: true });
     const r1 = rows.find((r) => r.id === v1.id)!;
@@ -293,7 +298,7 @@ describe("blocker #4 — version-chain and junction integrity at the database", 
   it("the DB rejects a current_version_fk pointing at another asset's version", async () => {
     const { asset } = await seedEligibleAsset(A);
     const { transport } = capturingTransport();
-    await generateAssetVersion(A, asset.id, { transport });
+    await generateAssetVersion(A, backend.userA.userId, asset.id, { transport });
     const other = await createRow<CareerAsset>(A, "career_assets", { asset_type: "story" });
     const v = (await listRows<AssetVersion>(A, "asset_versions", { eq: { asset_fk: asset.id }, includeArchived: true }))[0];
     const res = await A.from("career_assets").update({ current_version_fk: v.id }).eq("id", other.id).select();
@@ -303,14 +308,18 @@ describe("blocker #4 — version-chain and junction integrity at the database", 
   it("supersession is server-only, and the integrity trigger still guards the privileged path", async () => {
     const { asset } = await seedEligibleAsset(A);
     const { transport } = capturingTransport();
-    const v1 = (await generateAssetVersion(A, asset.id, { transport })).version!;
-    const v2 = (await generateAssetVersion(A, asset.id, { transport })).version!;
+    const v1 = (await generateAssetVersion(A, backend.userA.userId, asset.id, { transport })).version!;
+    const v2 = (await generateAssetVersion(A, backend.userA.userId, asset.id, { transport })).version!;
     const otherAsset = await createRow<CareerAsset>(A, "career_assets", { asset_type: "story" });
     // asset_versions is client-read-only: the foreign version has to be made
     // through the transactional commit path like any other.
-    const foreign = (await A.rpc("ccc_commit_asset_version", {
-      p_asset: otherAsset.id, p_content: "x", p_model: "", p_prompt_hash: "",
-      p_blocked: false, p_block_reason: "", p_privacy: null, p_truth_summary: "", p_ack: false,
+    // The low-level commit is revoked from browser roles, so the foreign
+    // version is created through the privileged harness — the same role the
+    // production service-role key maps to.
+    const foreign = (await backend.serviceClient!.rpc("ccc_commit_asset_version", {
+      p_user: backend.userA.userId, p_asset: otherAsset.id, p_content: "x",
+      p_model: "", p_prompt_hash: "", p_blocked: false, p_block_reason: "", p_ack: false,
+      p_audit: { output_type: "asset_story", model_used: "", output_text: "x" },
     })).data as AssetVersion;
 
     // Layer 1: a client statement against asset_versions matches nothing.

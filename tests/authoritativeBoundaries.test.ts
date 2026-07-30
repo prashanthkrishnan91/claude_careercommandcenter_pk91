@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { createBackend, type TestBackend } from "./backends";
+import { setAdminClientForTests } from "../lib/server/supabaseAdmin";
 import {
   addVersionToCollection,
   approveCollection,
@@ -9,8 +10,7 @@ import {
   logExternalUse,
   setCurrentCollection,
 } from "../lib/assetService";
-import { authorManualVersion } from "../lib/assetService";
-import { generateAssetVersion } from "../lib/server/assetGeneration";
+import { authorManualVersionServer, generateAssetVersion } from "../lib/server/assetGeneration";
 import { gateGraph, resolveSourceGraph } from "../lib/sourceGraph";
 import { createRow, getRow, listRows, updateRow } from "../lib/genericRepo";
 import {
@@ -35,9 +35,13 @@ beforeAll(async () => {
   backend = await createBackend();
   A = backend.userA.db;
   B = backend.userB.db;
+  // The server-only commit runs through the privileged adapter, exactly as the
+  // production route runs it through the service-role key.
+  setAdminClientForTests(backend.serviceClient!);
   await backend.cleanup();
 });
 afterAll(async () => {
+  setAdminClientForTests(null);
   await backend.cleanup();
   await backend.teardown();
 });
@@ -83,7 +87,7 @@ async function seedAsset(db: SupabaseClient, opts: { verifiedEvidence?: boolean;
 }
 
 async function approvedVersion(db: SupabaseClient, assetId: string): Promise<AssetVersion> {
-  const gen = await generateAssetVersion(db, assetId, { transport: stub });
+  const gen = await generateAssetVersion(db, backend.userA.userId, assetId, { transport: stub });
   if (!gen.version) throw new Error(`generation blocked: ${JSON.stringify(gen.blocked)}`);
   return await approveVersion(db, gen.version.id);
 }
@@ -166,7 +170,7 @@ describe("2. version commits are transactional and correctly ordered", () => {
   it("concurrent commits produce a dense ordered chain with no duplicate numbers", async () => {
     const { asset } = await seedAsset(A);
     await Promise.all(
-      Array.from({ length: 5 }, () => generateAssetVersion(A, asset.id, { transport: stub })),
+      Array.from({ length: 5 }, () => generateAssetVersion(A, backend.userA.userId, asset.id, { transport: stub })),
     );
     const versions = await listRows<AssetVersion>(A, "asset_versions", { eq: { asset_fk: asset.id }, includeArchived: true });
     const numbers = versions.map((v) => v.version_number).sort((a, b) => a - b);
@@ -182,7 +186,7 @@ describe("2. version commits are transactional and correctly ordered", () => {
 
   it("a failing commit rolls back completely — no orphan version, no repointed asset", async () => {
     const { asset } = await seedAsset(A);
-    const v1 = (await generateAssetVersion(A, asset.id, { transport: stub })).version!;
+    const v1 = (await generateAssetVersion(A, backend.userA.userId, asset.id, { transport: stub })).version!;
     const before = await getRow<CareerAsset>(A, "career_assets", asset.id);
     // an invalid privacy class aborts the function AFTER the insert statement
     const res = await A.rpc("ccc_commit_asset_version", {
@@ -200,9 +204,9 @@ describe("2. version commits are transactional and correctly ordered", () => {
 
   it("a blocked commit never becomes current and never supersedes a good version", async () => {
     const { asset, ach } = await seedAsset(A);
-    const good = (await generateAssetVersion(A, asset.id, { transport: stub })).version!;
+    const good = (await generateAssetVersion(A, backend.userA.userId, asset.id, { transport: stub })).version!;
     await updateAchievement(A, ach.id, { truth_status: "DISPUTED" });
-    await generateAssetVersion(A, asset.id, { transport: stub }); // records a blocked version
+    await generateAssetVersion(A, backend.userA.userId, asset.id, { transport: stub }); // records a blocked version
     const a = await getRow<CareerAsset>(A, "career_assets", asset.id);
     expect(a?.current_version_fk).toBe(good.id);
     const versions = await listRows<AssetVersion>(A, "asset_versions", { eq: { asset_fk: asset.id }, includeArchived: true });
@@ -225,11 +229,11 @@ describe("3. external use is an authoritative record, not a client-writable log"
 
   it("rejects an unapproved, blocked, foreign-asset or superseded version", async () => {
     const { asset } = await seedAsset(A);
-    const unapproved = (await generateAssetVersion(A, asset.id, { transport: stub })).version!;
+    const unapproved = (await generateAssetVersion(A, backend.userA.userId, asset.id, { transport: stub })).version!;
     await expect(logExternalUse(A, unapproved.id, "X")).rejects.toThrow(/approved/);
     const approved = await approveVersion(A, unapproved.id);
     // a newer version supersedes it → the old one is history, not distributable
-    await generateAssetVersion(A, asset.id, { transport: stub });
+    await generateAssetVersion(A, backend.userA.userId, asset.id, { transport: stub });
     await expect(logExternalUse(A, approved.id, "X")).rejects.toThrow(/superseded|current/);
   });
 
@@ -262,7 +266,7 @@ describe("4. collections package exact approved versions", () => {
   it("membership requires an approved, unblocked, same-asset version", async () => {
     const { asset } = await seedAsset(A);
     const coll = await createRow<{ id: string }>(A, "asset_collections", { name: "Resume", collection_type: "resume_version" });
-    const v = (await generateAssetVersion(A, asset.id, { transport: stub })).version!;
+    const v = (await generateAssetVersion(A, backend.userA.userId, asset.id, { transport: stub })).version!;
     await expect(addVersionToCollection(A, coll.id, v.id)).rejects.toThrow(/approved/);
     await approveVersion(A, v.id);
     await addVersionToCollection(A, coll.id, v.id);
@@ -342,7 +346,7 @@ describe("5. complete source-graph eligibility", () => {
 
     await updateRow(A, "target_archetypes", archetype.id, { approved_by_user_bool: true });
     const calls: Array<{ system: string; user: string }> = [];
-    await generateAssetVersion(A, asset.id, {
+    await generateAssetVersion(A, backend.userA.userId, asset.id, {
       transport: async (o) => {
         calls.push(o);
         return { ok: true as const, text: "ok", model: "stub" };
@@ -360,7 +364,7 @@ describe("5. complete source-graph eligibility", () => {
       parsed_summary: "director analytics summary",
     });
     const calls2: Array<{ system: string; user: string }> = [];
-    await generateAssetVersion(A, asset.id, {
+    await generateAssetVersion(A, backend.userA.userId, asset.id, {
       transport: async (o) => {
         calls2.push(o);
         return { ok: true as const, text: "ok", model: "stub" };
@@ -454,7 +458,7 @@ describe("6. maturity is live, not a cached snapshot", () => {
     const { asset, archetype } = await seedAsset(A);
     const v1 = await approvedVersion(A, asset.id);
     // a newer UNAPPROVED version becomes current; v1 is superseded history
-    await generateAssetVersion(A, asset.id, { transport: stub });
+    await generateAssetVersion(A, backend.userA.userId, asset.id, { transport: stub });
     const a = await getRow<CareerAsset>(A, "career_assets", asset.id);
     expect(a?.current_version_fk).not.toBe(v1.id);
     const crit = await A.rpc("ccc_maturity_criteria", { uid: backend.userA.userId });
@@ -545,7 +549,7 @@ describe("7. complete P1 and override coverage", () => {
 describe("8. safety-critical transitions reject direct PostgREST bypass", () => {
   it("asset_versions is client-read-only: insert, update and delete all match nothing", async () => {
     const { asset } = await seedAsset(A);
-    const v = (await generateAssetVersion(A, asset.id, { transport: stub })).version!;
+    const v = (await generateAssetVersion(A, backend.userA.userId, asset.id, { transport: stub })).version!;
     // RLS grants no write policy, so a forged statement affects ZERO rows.
     expect((await A.from("asset_versions")
       .update({ approved_by_user_bool: true, approved_at: new Date().toISOString() })
@@ -566,7 +570,7 @@ describe("8. safety-critical transitions reject direct PostgREST bypass", () => 
   it("a blocked version cannot be unblocked or acknowledged, even privileged", async () => {
     const { asset, ach } = await seedAsset(A);
     await updateAchievement(A, ach.id, { truth_status: "DISPUTED" });
-    await generateAssetVersion(A, asset.id, { transport: stub });
+    await generateAssetVersion(A, backend.userA.userId, asset.id, { transport: stub });
     const blocked = (await listRows<AssetVersion>(A, "asset_versions", { eq: { asset_fk: asset.id }, includeArchived: true }))[0];
     expect(blocked.blocked_bool).toBe(true);
     expect((await A.from("asset_versions").update({ blocked_bool: false }).eq("id", blocked.id).select()).data).toEqual([]);
@@ -580,7 +584,7 @@ describe("8. safety-critical transitions reject direct PostgREST bypass", () => 
 
   it("approval through the RPC still fails when the graph is ineligible", async () => {
     const { asset, ach } = await seedAsset(A);
-    const v = (await generateAssetVersion(A, asset.id, { transport: stub })).version!;
+    const v = (await generateAssetVersion(A, backend.userA.userId, asset.id, { transport: stub })).version!;
     await updateAchievement(A, ach.id, { truth_status: "NEEDS_PROOF" });
     const res = await A.rpc("ccc_approve_asset_version", { p_version: v.id });
     expect(res.error?.message).toMatch(/source graph/);
@@ -719,15 +723,195 @@ describe("9. write bypasses closed at the table level", () => {
 
   it("a hand-authored version is committed transactionally and cannot forge model metadata", async () => {
     const { asset } = await seedAsset(A);
-    const v = await authorManualVersion(A, asset.id, "Hand-written bullet.");
+    const v = await authorManualVersionServer(backend.userA.userId, asset.id, "Hand-written bullet.");
     expect(v.version_number).toBe(1);
     expect(v.generated_by_model).toBe("");
     expect(v.generation_prompt_hash).toBe("");
     const a = await getRow<CareerAsset>(A, "career_assets", asset.id);
     expect(a?.current_version_fk).toBe(v.id);
-    const empty = await A.rpc("ccc_author_manual_version", {
-      p_asset: asset.id, p_content: "   ", p_privacy: null, p_truth_summary: "",
+    // Empty content is refused on the server-only path…
+    const empty = await backend.serviceClient!.rpc("ccc_author_manual_version", {
+      p_user: backend.userA.userId, p_asset: asset.id, p_content: "   ",
     });
     expect(empty.error?.message).toMatch(/needs content/);
+    // …and the manual commit is not reachable by a browser client at all.
+    const forged = await A.rpc("ccc_author_manual_version", {
+      p_user: backend.userA.userId, p_asset: asset.id, p_content: "forged",
+    });
+    expect(forged.error).not.toBeNull();
+    // A user-authored audit row accompanies the legitimate version.
+    const audits = await listRows<{ output_type: string; model_used: string }>(A, "ai_outputs", { includeArchived: true });
+    expect(audits.some((r) => r.output_type === "asset_manual" && r.model_used === "")).toBe(true);
+  });
+});
+
+describe("10. the version-commit authority is server-only", () => {
+  const LOW_LEVEL = [
+    "ccc_commit_asset_version",
+    "ccc_author_manual_version",
+    "ccc_record_ai_audit",
+    "ccc_asset_graph_eligible_for",
+    "ccc_truth_summary",
+  ];
+
+  it("no browser role holds EXECUTE on any low-level lifecycle function", async () => {
+    const rows = await rawSql(`
+      select p.proname, r.rolname
+        from pg_proc p
+        join pg_namespace n on n.oid = p.pronamespace,
+             unnest(array['public','anon','authenticated']) r(rolname)
+       where n.nspname = 'public'
+         and p.proname = any(array[${LOW_LEVEL.map((f) => `'${f}'`).join(",")}])
+         and has_function_privilege(r.rolname, p.oid, 'execute')`);
+    expect(rows).toEqual([]);
+    // and the service role does hold it, so the server path still works
+    const granted = await rawSql(`
+      select p.proname from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+       where n.nspname='public' and p.proname = 'ccc_commit_asset_version'
+         and has_function_privilege('service_role', p.oid, 'execute')`);
+    expect(granted.length).toBe(1);
+  });
+
+  it("an authenticated browser client is denied the low-level commit", async () => {
+    const { asset } = await seedAsset(A);
+    const res = await A.rpc("ccc_commit_asset_version", {
+      p_user: backend.userA.userId, p_asset: asset.id, p_content: "forged",
+      p_model: "gpt-fake", p_prompt_hash: "forged", p_blocked: false,
+      p_block_reason: "", p_ack: false, p_audit: { output_type: "forged" },
+    });
+    expect(res.error?.message).toMatch(/permission denied|does not exist/);
+    expect(await listRows(A, "asset_versions", { includeArchived: true })).toEqual([]);
+  });
+
+  it("the anon role is denied the low-level functions", async () => {
+    for (const fn of LOW_LEVEL) {
+      const rows = await rawSql(`
+        select has_function_privilege('anon', p.oid, 'execute') as ok
+          from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+         where n.nspname='public' and p.proname='${fn}'`);
+      for (const r of rows) expect(r.ok, `anon should not execute ${fn}`).toBe(false);
+    }
+  });
+
+  it("a service-role call cannot commit to another user's asset", async () => {
+    const { asset } = await seedAsset(A);
+    const res = await backend.serviceClient!.rpc("ccc_commit_asset_version", {
+      p_user: backend.userB.userId, p_asset: asset.id, p_content: "stolen",
+      p_model: "", p_prompt_hash: "", p_blocked: false, p_block_reason: "",
+      p_ack: false, p_audit: { output_type: "asset_resume_bullet" },
+    });
+    expect(res.error?.message).toMatch(/asset not found for this user/);
+    expect(await listRows(A, "asset_versions", { includeArchived: true })).toEqual([]);
+  });
+
+  it("a commit without an audit record is refused outright", async () => {
+    const { asset } = await seedAsset(A);
+    const res = await backend.serviceClient!.rpc("ccc_commit_asset_version", {
+      p_user: backend.userA.userId, p_asset: asset.id, p_content: "unaudited",
+      p_model: "m", p_prompt_hash: "h", p_blocked: false, p_block_reason: "",
+      p_ack: false, p_audit: {},
+    });
+    expect(res.error?.message).toMatch(/audit record is required/);
+    expect(await listRows(A, "asset_versions", { includeArchived: true })).toEqual([]);
+  });
+
+  it("every generated version has a matching audit row; blocked and unavailable attempts audit too", async () => {
+    const { asset, ach } = await seedAsset(A);
+    // success
+    const gen = await generateAssetVersion(A, backend.userA.userId, asset.id, { transport: stub });
+    expect(gen.version).toBeDefined();
+    let audits = await listRows<{ output_type: string; blocked_bool: boolean; model_used: string }>(A, "ai_outputs", { includeArchived: true });
+    expect(audits.filter((r) => !r.blocked_bool && r.model_used === "stub-model")).toHaveLength(1);
+
+    // blocked: a version AND an audit, both recording the block
+    await updateAchievement(A, ach.id, { truth_status: "DISPUTED" });
+    const blocked = await generateAssetVersion(A, backend.userA.userId, asset.id, { transport: stub });
+    expect(blocked.blocked).toBeDefined();
+    audits = await listRows<{ output_type: string; blocked_bool: boolean; model_used: string }>(A, "ai_outputs", { includeArchived: true });
+    expect(audits.filter((r) => r.blocked_bool)).toHaveLength(1);
+
+    // every non-blocked version is accounted for by a successful audit
+    const versions = await listRows<AssetVersion>(A, "asset_versions", { includeArchived: true });
+    const generated = versions.filter((v) => !v.blocked_bool && v.generated_by_model !== "");
+    const successAudits = audits.filter((r) => !r.blocked_bool);
+    expect(successAudits.length).toBeGreaterThanOrEqual(generated.length);
+
+    // unavailable: no version, but the attempt is still recorded
+    await updateAchievement(A, ach.id, { truth_status: "VERIFIED" });
+    const priorKey = process.env.ANTHROPIC_API_KEY;
+    const priorStub = process.env.CCC_AI_TRANSPORT;
+    delete process.env.ANTHROPIC_API_KEY;
+    delete process.env.CCC_AI_TRANSPORT;
+    try {
+      const before = (await listRows(A, "asset_versions", { includeArchived: true })).length;
+      const res = await generateAssetVersion(A, backend.userA.userId, asset.id, {});
+      expect(res.unavailable).toBe(true);
+      expect((await listRows(A, "asset_versions", { includeArchived: true })).length).toBe(before);
+      const after = await listRows<{ block_reason: string }>(A, "ai_outputs", { includeArchived: true });
+      expect(after.some((r) => /unavailable/.test(r.block_reason))).toBe(true);
+    } finally {
+      if (priorKey !== undefined) process.env.ANTHROPIC_API_KEY = priorKey;
+      if (priorStub !== undefined) process.env.CCC_AI_TRANSPORT = priorStub;
+    }
+  });
+
+  it("browser-supplied model, prompt, privacy and truth fields cannot reach a version", async () => {
+    const { asset } = await seedAsset(A);
+    // The commit signature has no privacy or truth parameters at all — they
+    // are derived — so a caller cannot even express them.
+    const args = await rawSql(`
+      select pg_get_function_arguments(p.oid) as args
+        from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+       where n.nspname='public' and p.proname='ccc_commit_asset_version'`);
+    expect(String(args[0].args)).not.toMatch(/p_privacy|p_truth_summary/);
+
+    // Manual authoring accepts only user, asset and content.
+    const manualArgs = await rawSql(`
+      select pg_get_function_arguments(p.oid) as args
+        from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+       where n.nspname='public' and p.proname='ccc_author_manual_version'`);
+    expect(String(manualArgs[0].args)).toBe("p_user uuid, p_asset uuid, p_content text");
+
+    // A hand-authored version is recorded as hand-authored: no model metadata.
+    const v = await authorManualVersionServer(backend.userA.userId, asset.id, "Typed by hand.");
+    expect(v.generated_by_model).toBe("");
+    expect(v.generation_prompt_hash).toBe("");
+  });
+
+  it("a manual version on an INELIGIBLE graph saves but stays non-external and non-approved", async () => {
+    const { asset, ach } = await seedAsset(A);
+    await updateAchievement(A, ach.id, { truth_status: "NEEDS_PROOF" });
+    const v = await authorManualVersionServer(backend.userA.userId, asset.id, "Written while sources are unproven.");
+    expect(v.content).toContain("Written while sources");
+    const a = await getRow<CareerAsset>(A, "career_assets", asset.id);
+    // visibly stale, never promoted to PUBLIC_SAFE
+    expect(a?.eligibility_stale_bool).toBe(true);
+    expect(a?.privacy_class).not.toBe("PUBLIC_SAFE");
+    // and it cannot be approved or used externally until the graph is clean
+    expect((await A.rpc("ccc_approve_asset_version", { p_version: v.id })).error?.message).toMatch(/source graph/);
+    const audits = await listRows<{ output_type: string; block_reason: string }>(A, "ai_outputs", { includeArchived: true });
+    const manual = audits.find((r) => r.output_type === "asset_manual");
+    expect(manual?.block_reason).toMatch(/ineligible/);
+  });
+
+  it("a direct asset INSERT cannot fabricate any derived field", async () => {
+    const { asset: real } = await seedAsset(A);
+    const v = await approvedVersion(A, real.id);
+    const forged = await createRow<CareerAsset>(A, "career_assets", {
+      asset_type: "resume_bullet",
+      current_version_fk: v.id,
+      truth_status_summary: "VERIFIED,forged",
+      privacy_class: "PUBLIC_SAFE",
+      used_externally_bool: true,
+      eligibility_stale_bool: false,
+      eligibility_reason: "forged clean",
+    } as never);
+    // every derived field is overwritten with its canonical born-unproven value
+    expect(forged.current_version_fk).toBeNull();
+    expect(forged.truth_status_summary).toBe("");
+    expect(forged.privacy_class).toBe("INTERNAL_ONLY");
+    expect(forged.used_externally_bool).toBe(false);
+    expect(forged.eligibility_stale_bool).toBe(false);
+    expect(forged.eligibility_reason).toBe("");
   });
 });

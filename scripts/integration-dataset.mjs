@@ -220,12 +220,19 @@ export async function eligibilityWorkflow(db, { assetId, metricId, evidenceId })
 }
 
 // ── Version-exact collections: package → approve → current → invalidate ────
-export async function collectionWorkflow(db, { assetId, achievementId }) {
-  const committed = await callRpc(db, "ccc_commit_asset_version", {
-    p_asset: assetId, p_content: "Cut churn forecast error 18% across a 3-team rebuild.",
-    p_model: "fixture", p_prompt_hash: "fixture", p_blocked: false, p_block_reason: "",
-    p_privacy: "PUBLIC_SAFE", p_truth_summary: "VERIFIED", p_ack: false,
-  });
+/**
+ * @param createVersion an INJECTED adapter that produces a version. The
+ *   low-level commit RPC is not executable by any browser role, so this module
+ *   never calls it directly: the browser certification passes an adapter that
+ *   posts to the protected application API, and the hermetic suite passes one
+ *   backed by the privileged service-role harness. Neither needs — nor gets —
+ *   production browser access to the internal function.
+ */
+export async function collectionWorkflow(db, { assetId, achievementId, createVersion }) {
+  if (typeof createVersion !== "function") {
+    throw new Error("collectionWorkflow needs a createVersion adapter (protected API or privileged harness)");
+  }
+  const committed = await createVersion(assetId);
   const version = await callRpc(db, "ccc_approve_asset_version", { p_version: committed.id });
   if (!version.approved_by_user_bool) throw new Error("version approval did not persist");
 
@@ -478,6 +485,21 @@ export async function bypassAttempts(db, { assetId, versionId, collectionId }) {
     db.from("collection_assets").delete().eq("collection_fk", collectionId).select());
   await mustFail("insert collection membership", () =>
     db.from("collection_assets").insert({ collection_fk: collectionId, asset_fk: assetId, version_fk: versionId }).select());
+
+  // The low-level lifecycle functions are revoked from every browser role, so
+  // an ordinary authenticated client cannot reach them at all.
+  await mustFail("call ccc_commit_asset_version as an authenticated browser client", () =>
+    db.rpc("ccc_commit_asset_version", {
+      p_user: null, p_asset: assetId, p_content: "forged", p_model: "gpt-fake",
+      p_prompt_hash: "forged", p_blocked: false, p_block_reason: "", p_ack: false,
+      p_audit: { output_type: "forged" },
+    }));
+  await mustFail("call ccc_author_manual_version as an authenticated browser client", () =>
+    db.rpc("ccc_author_manual_version", { p_user: null, p_asset: assetId, p_content: "forged" }));
+  await mustFail("call ccc_record_ai_audit as an authenticated browser client", () =>
+    db.rpc("ccc_record_ai_audit", { p_user: null, p_audit: { output_type: "forged" } }));
+  await mustFail("call ccc_asset_graph_eligible_for as an authenticated browser client", () =>
+    db.rpc("ccc_asset_graph_eligible_for", { p_user: null, p_asset: assetId }));
   return refusals;
 }
 

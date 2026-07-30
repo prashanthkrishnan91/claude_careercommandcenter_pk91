@@ -12,6 +12,7 @@ const MIGRATIONS = [
   path.resolve(__dirname, "../../supabase/migrations/20260730020000_enforcement_corrections.sql"),
   path.resolve(__dirname, "../../supabase/migrations/20260730030000_authoritative_boundaries.sql"),
   path.resolve(__dirname, "../../supabase/migrations/20260730040000_close_write_bypasses.sql"),
+  path.resolve(__dirname, "../../supabase/migrations/20260730050000_server_only_commit.sql"),
 ];
 
 // Minimal PostgREST-style query builder over PGlite, covering exactly the
@@ -37,6 +38,7 @@ class PgliteQuery implements PromiseLike<SbResult> {
     private readonly pg: PGlite,
     private readonly table: string,
     private readonly userId: string,
+    private readonly asRole: "authenticated" | "service_role" = "authenticated",
   ) {}
 
   insert(values: Record<string, unknown>): this {
@@ -161,8 +163,12 @@ class PgliteQuery implements PromiseLike<SbResult> {
     try {
       const { sql, params } = this.buildSql();
       const rows = await this.pg.transaction(async (tx: Transaction) => {
-        await tx.query("select set_config('request.jwt.claim.sub', $1, true)", [this.userId]);
-        await tx.query("set local role authenticated");
+        // The service role carries NO jwt claim, so auth.uid() is null — the
+        // same condition the production service-role key produces.
+        if (this.asRole === "authenticated") {
+          await tx.query("select set_config('request.jwt.claim.sub', $1, true)", [this.userId]);
+        }
+        await tx.query(`set local role ${this.asRole}`);
         const res = await tx.query<{ row: unknown }>(sql, params);
         return res.rows;
       });
@@ -184,9 +190,13 @@ class PgliteQuery implements PromiseLike<SbResult> {
   }
 }
 
-function makeClient(pg: PGlite, userId: string): SupabaseClient {
+function makeClient(
+  pg: PGlite,
+  userId: string,
+  asRole: "authenticated" | "service_role" = "authenticated",
+): SupabaseClient {
   const client = {
-    from: (table: string) => new PgliteQuery(pg, table, userId),
+    from: (table: string) => new PgliteQuery(pg, table, userId, asRole),
     // The slice of the auth surface the shared dataset module uses.
     auth: {
       getUser: async () => ({ data: { user: { id: userId } }, error: null }),
@@ -200,8 +210,10 @@ function makeClient(pg: PGlite, userId: string): SupabaseClient {
       const call = `select public.${fn}(${keys.map((k, i) => `${k} := $${i + 1}`).join(", ")}) as row`;
       try {
         const rows = await pg.transaction(async (tx: Transaction) => {
-          await tx.query("select set_config('request.jwt.claim.sub', $1, true)", [userId]);
-          await tx.query("set local role authenticated");
+          if (asRole === "authenticated") {
+            await tx.query("select set_config('request.jwt.claim.sub', $1, true)", [userId]);
+          }
+          await tx.query(`set local role ${asRole}`);
           const res = await tx.query<{ row: unknown }>(call, keys.map((k) => args[k]));
           return res.rows;
         });
@@ -229,6 +241,7 @@ export async function createPgliteBackend(): Promise<TestBackend> {
       select nullif(current_setting('request.jwt.claim.sub', true), '')::uuid
     $auth_uid$;
     create role authenticated nologin;
+    create role anon nologin;
   `);
 
   for (const migration of MIGRATIONS) {
@@ -245,11 +258,16 @@ export async function createPgliteBackend(): Promise<TestBackend> {
   await pg.query("insert into auth.users (id) values ($1), ($2)", [userAId, userBId]);
 
   const mk = (userId: string): TestUserCtx => ({ db: makeClient(pg, userId), userId });
+  // The privileged adapter: `service_role`, no jwt claim. Test-only; it exists
+  // so the hermetic suite can drive the server-only path WITHOUT granting the
+  // browser roles any execute permission on the low-level functions.
+  const serviceClient = makeClient(pg, "", "service_role");
 
   return {
     name: "pglite (hermetic, real migrations + RLS)",
     userA: mk(userAId),
     userB: mk(userBId),
+    serviceClient,
     // Raw superuser SQL for schema-shape assertions (hermetic backend only).
     async sql(query: string) {
       const res = await pg.query(query);

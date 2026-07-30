@@ -185,11 +185,15 @@ describe("security objects", () => {
       "ccc_remove_collection_version",
       "ccc_refresh_asset_eligibility",
       "ccc_demote_invalid_collection",
+      // server-only commit authority
+      "ccc_asset_graph_eligible_for",
+      "ccc_truth_summary",
+      "ccc_record_ai_audit",
     ];
     const rows = await sql(
       `select proname, prosecdef, proconfig from pg_proc where proname like 'ccc_%'`,
     );
-    expect(rows.length).toBeGreaterThanOrEqual(35);
+    expect(rows.length).toBeGreaterThanOrEqual(39);
     for (const r of rows) {
       if (JUSTIFIED.includes(String(r.proname))) {
         expect(r.prosecdef, `${r.proname} definer`).toBe(true);
@@ -253,6 +257,7 @@ describe("security objects", () => {
       "ccc_override_audit_immutable",
       "ccc_ach_source_change",
       "ccc_collection_member_demote",
+      "ccc_assets_00_insert_defaults",
     ]) {
       expect(names).toContain(t);
     }

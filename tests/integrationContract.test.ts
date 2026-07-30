@@ -30,6 +30,28 @@ let backend: TestBackend;
 let A: SupabaseClient;
 const rawSql = (q: string) => backend.sql!(q);
 
+/**
+ * The privileged harness the hermetic run injects for version creation. It is
+ * the `service_role` adapter — the same role the production key maps to — so
+ * the internal commit is exercised WITHOUT granting the browser roles any
+ * execute permission on it.
+ */
+const privilegedCreateVersion = (userId: string) => async (assetId: string) => {
+  const { data, error } = await backend.serviceClient!.rpc("ccc_commit_asset_version", {
+    p_user: userId,
+    p_asset: assetId,
+    p_content: "Cut churn forecast error 18% across a 3-team rebuild.",
+    p_model: "fixture-harness",
+    p_prompt_hash: "fixture",
+    p_blocked: false,
+    p_block_reason: "",
+    p_ack: false,
+    p_audit: { output_type: "asset_resume_bullet", model_used: "fixture-harness", output_text: "fixture" },
+  });
+  if (error) throw new Error(`privileged commit: ${error.message}`);
+  return data as { id: string };
+};
+
 beforeAll(async () => {
   backend = await createPgliteBackend();
   A = backend.userA.db;
@@ -112,6 +134,7 @@ describe("integration dataset contract (the browser script's operations, hermeti
     });
     const { version, collection } = await collectionWorkflow(A, {
       assetId: asset.id, achievementId: achievement.id,
+      createVersion: privilegedCreateVersion(backend.userA.userId),
     });
     expect(version.approved_by_user_bool).toBe(true);
     const { data: members } = await A.from("collection_assets").select("*").eq("collection_fk", collection.id);
@@ -191,6 +214,7 @@ describe("integration dataset contract (the browser script's operations, hermeti
     });
     const { version, collection } = await collectionWorkflow(A, {
       assetId: asset.id, achievementId: achievement.id,
+      createVersion: privilegedCreateVersion(backend.userA.userId),
     });
     const refusals = await bypassAttempts(A, {
       assetId: asset.id, versionId: version.id, collectionId: collection.id,
@@ -201,6 +225,10 @@ describe("integration dataset contract (the browser script's operations, hermeti
       "flip eligibility_stale_bool", "rewrite truth_status_summary",
       "update collection membership", "delete collection membership",
       "insert collection membership",
+      "call ccc_commit_asset_version as an authenticated browser client",
+      "call ccc_author_manual_version as an authenticated browser client",
+      "call ccc_record_ai_audit as an authenticated browser client",
+      "call ccc_asset_graph_eligible_for as an authenticated browser client",
     ]);
   });
 

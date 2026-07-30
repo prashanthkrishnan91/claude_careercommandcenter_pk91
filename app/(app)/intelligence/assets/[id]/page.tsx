@@ -179,7 +179,11 @@ export default function AssetDetailPage() {
               onClick={async () => {
                 const content = window.prompt("Manual version content (authored by you, no AI):");
                 if (!content) return;
-                await authorManualVersion(db, asset.id, content);
+                try {
+                  await authorManualVersion(asset.id, content);
+                } catch (e) {
+                  setNotice(e instanceof Error ? e.message : "authoring failed");
+                }
                 bump();
               }}
             >
