@@ -1,18 +1,34 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import type { SupabaseClient } from "@supabase/supabase-js";
 
-// OAuth state handling. NOTHING sensitive ever travels through the OAuth
-// `state` query parameter: state is a single-use random nonce, and the full
-// binding (user, provider, callback URL, PKCE verifier, issue/expiry, and the
-// caller's Supabase session token) lives in an ENCRYPTED + AUTHENTICATED
-// HttpOnly/Secure/SameSite=Lax cookie the browser cannot read.
+// OAuth state.
+//
+// AUTHORITY: a server-side `oauth_states` row, claimed ATOMICALLY by
+// `ccc_claim_oauth_state` — a single conditional UPDATE whose guard
+// (`consumed_at is null and expires_at > now()`) lives in the WHERE clause.
+// Two concurrent callbacks contend on the row lock; the loser re-evaluates the
+// guard after the winner commits and matches zero rows. Replay therefore fails
+// even when the attacker replays the original cookie, and even when both
+// requests arrive at the same instant. Cookie expiry is NOT the mechanism.
+//
+// The `state` query parameter is an opaque random nonce; only its SHA-256 hash
+// is stored. The PKCE verifier and the session binding are encrypted
+// (AES-256-GCM) before they reach the database, so a database reader alone
+// cannot complete or hijack a flow.
+//
+// The cookie remains only as the transport for the caller's own session so the
+// callback can act as that user; it confers no single-use property.
 
 const COOKIE_NAME = "ccc_oauth_state";
-const TTL_MS = 10 * 60 * 1000;
+const TTL_SECONDS = 600;
+
+export const OAUTH_PROVIDERS = ["gmail", "calendar"] as const;
+export type OAuthProvider = (typeof OAUTH_PROVIDERS)[number];
 
 export interface OAuthStateBinding {
   nonce: string;
   userId: string;
-  provider: "gmail" | "calendar";
+  provider: OAuthProvider;
   redirectUri: string;
   codeVerifier: string;
   supabaseAccessToken: string;
@@ -27,28 +43,44 @@ function key(): Buffer {
   return k;
 }
 
-export function seal(binding: OAuthStateBinding): string {
+export function encryptValue(plain: string): string {
   const iv = randomBytes(12);
   const cipher = createCipheriv("aes-256-gcm", key(), iv);
-  const enc = Buffer.concat([cipher.update(JSON.stringify(binding), "utf8"), cipher.final()]);
+  const enc = Buffer.concat([cipher.update(plain, "utf8"), cipher.final()]);
   return [iv.toString("base64url"), enc.toString("base64url"), cipher.getAuthTag().toString("base64url")].join(".");
 }
 
-export function open(sealed: string): OAuthStateBinding | null {
+export function decryptValue(sealed: string): string | null {
   try {
     const [iv, data, tag] = sealed.split(".").map((p) => Buffer.from(p, "base64url"));
     const decipher = createDecipheriv("aes-256-gcm", key(), iv);
     decipher.setAuthTag(tag);
-    const plain = Buffer.concat([decipher.update(data), decipher.final()]).toString("utf8");
-    return JSON.parse(plain) as OAuthStateBinding;
+    return Buffer.concat([decipher.update(data), decipher.final()]).toString("utf8");
   } catch {
     return null; // tampered / malformed / wrong key
   }
 }
 
+export const seal = (binding: OAuthStateBinding): string => encryptValue(JSON.stringify(binding));
+
+export function open(sealed: string): OAuthStateBinding | null {
+  const plain = decryptValue(sealed);
+  if (plain === null) return null;
+  try {
+    return JSON.parse(plain) as OAuthStateBinding;
+  } catch {
+    return null;
+  }
+}
+
+/** The nonce is stored only as a hash; the raw value lives in the URL once. */
+export function nonceHash(nonce: string): string {
+  return createHash("sha256").update(nonce).digest("hex");
+}
+
 export function newBinding(
   userId: string,
-  provider: "gmail" | "calendar",
+  provider: OAuthProvider,
   redirectUri: string,
   supabaseAccessToken: string,
   now = Date.now(),
@@ -61,7 +93,7 @@ export function newBinding(
     codeVerifier: randomBytes(48).toString("base64url"),
     supabaseAccessToken,
     iat: now,
-    exp: now + TTL_MS,
+    exp: now + TTL_SECONDS * 1000,
   };
 }
 
@@ -69,11 +101,61 @@ export function codeChallenge(verifier: string): string {
   return createHash("sha256").update(verifier).digest("base64url");
 }
 
+/** Persists the state server-side. Returns the row id; throws on failure. */
+export async function issueState(db: SupabaseClient, binding: OAuthStateBinding): Promise<string> {
+  const { data, error } = await db.rpc("ccc_issue_oauth_state", {
+    p_nonce_hash: nonceHash(binding.nonce),
+    p_provider: binding.provider,
+    p_redirect_uri: binding.redirectUri,
+    p_code_verifier_encrypted: encryptValue(binding.codeVerifier),
+    p_session_binding_encrypted: encryptValue(binding.supabaseAccessToken),
+    p_ttl_seconds: TTL_SECONDS,
+  });
+  if (error) throw new Error(error.message);
+  return data as string;
+}
+
+export interface ClaimedState {
+  id: string;
+  provider: OAuthProvider;
+  redirectUri: string;
+  codeVerifier: string;
+}
+
+/**
+ * Atomically consumes the state. Returns null when it does not exist, has
+ * already been consumed (replay), has expired, or belongs to another user.
+ */
+export async function claimState(db: SupabaseClient, nonce: string): Promise<ClaimedState | null> {
+  const { data, error } = await db.rpc("ccc_claim_oauth_state", { p_nonce_hash: nonceHash(nonce) });
+  if (error) return null;
+  const row = data as {
+    claimed: boolean;
+    id?: string;
+    provider?: string;
+    redirect_uri?: string;
+    code_verifier_encrypted?: string;
+  };
+  if (!row?.claimed) return null;
+  if (!OAUTH_PROVIDERS.includes(row.provider as OAuthProvider)) return null;
+  const verifier = decryptValue(row.code_verifier_encrypted ?? "");
+  if (verifier === null) return null;
+  return {
+    id: row.id!,
+    provider: row.provider as OAuthProvider,
+    redirectUri: row.redirect_uri ?? "",
+    codeVerifier: verifier,
+  };
+}
+
 export type StateValidation =
   | { ok: true; binding: OAuthStateBinding }
   | { ok: false; reason: "missing" | "malformed" | "expired" | "nonce_mismatch" | "bad_provider" };
 
-/** Constant-time nonce comparison; rejects missing/tampered/expired state. */
+/**
+ * Cookie-side checks (cheap, local). These reject obviously bad requests
+ * before the database round-trip; they are NOT the single-use mechanism.
+ */
 export function validateState(
   sealedCookie: string | undefined,
   stateParam: string | null,
@@ -82,9 +164,7 @@ export function validateState(
   if (!sealedCookie || !stateParam) return { ok: false, reason: "missing" };
   const binding = open(sealedCookie);
   if (!binding) return { ok: false, reason: "malformed" };
-  if (binding.provider !== "gmail" && binding.provider !== "calendar") {
-    return { ok: false, reason: "bad_provider" };
-  }
+  if (!OAUTH_PROVIDERS.includes(binding.provider)) return { ok: false, reason: "bad_provider" };
   if (now > binding.exp) return { ok: false, reason: "expired" };
   const a = Buffer.from(binding.nonce);
   const b = Buffer.from(stateParam);
@@ -110,3 +190,5 @@ export function readStateCookie(req: Request): string | undefined {
   }
   return undefined;
 }
+
+export { TTL_SECONDS as OAUTH_STATE_TTL_SECONDS };

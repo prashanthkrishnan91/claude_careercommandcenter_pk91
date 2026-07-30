@@ -101,13 +101,22 @@ export interface CareerAsset {
   target_archetype_fk: string | null;
   truth_status_summary: string;
   privacy_class: PrivacyClass;
-  used_externally_bool: boolean;
-  external_use_log: Array<{ at: string; destination: string; version: number }>;
+  used_externally_bool: boolean; // DERIVED from asset_external_uses by trigger
   eligibility_stale_bool: boolean;
   eligibility_reason: string;
   status: "active" | "archived";
   created_at: string;
   updated_at: string;
+}
+
+export interface AssetExternalUse {
+  id: string;
+  user_id: string;
+  asset_fk: string;
+  version_fk: string;
+  destination: string;
+  used_at: string;
+  created_at: string;
 }
 
 export interface AssetVersion {
@@ -123,6 +132,8 @@ export interface AssetVersion {
   approved_by_user_bool: boolean;
   approved_at: string | null;
   superseded_by_fk: string | null;
+  /** the ATTESTED_NO_METRIC acknowledgment actually given at generation time */
+  attested_no_metric_ack_bool: boolean;
   created_at: string;
 }
 

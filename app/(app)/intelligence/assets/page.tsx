@@ -8,12 +8,12 @@ import PageHeader from "@/components/PageHeader";
 import RowList from "@/components/RowList";
 import { useShell } from "@/components/ShellContext";
 import { SpecAddForm, normalizeSpecValues, type FieldSpec } from "@/components/SpecForm";
-import { archiveRow, createRow, listRows, updateRow } from "@/lib/genericRepo";
-import { addAssetToCollection, AssetGateError } from "@/lib/assetService";
+import { archiveRow, createRow, listRows } from "@/lib/genericRepo";
+import { addVersionToCollection, approveCollection, AssetGateError, revalidateCollection, setCurrentCollection } from "@/lib/assetService";
 import { useVaultData } from "@/lib/hooks";
 import { listAchievements } from "@/lib/repos";
 import { getSupabase } from "@/lib/supabase";
-import type { AssetCollection, CareerAsset, TargetArchetype } from "@/lib/entities";
+import type { AssetCollection, AssetVersion, CareerAsset, TargetArchetype } from "@/lib/entities";
 
 const ASSET_TYPES = ["resume_bullet", "story", "li_post", "cover_letter", "positioning", "interview_answer"] as const;
 const COLLECTION_SPECS: FieldSpec[] = [
@@ -27,15 +27,16 @@ export default function AssetsPage() {
   const { bump } = useShell();
   const db = getSupabase();
   const loader = useCallback(async (dbc: SupabaseClient) => {
-    const [assets, collections, achievements, archetypes, sourceLinks, memberships] = await Promise.all([
+    const [assets, collections, achievements, archetypes, sourceLinks, memberships, versions] = await Promise.all([
       listRows<CareerAsset>(dbc, "career_assets", { includeArchived: true }),
       listRows<AssetCollection>(dbc, "asset_collections", {}),
       listAchievements(dbc),
       listRows<TargetArchetype>(dbc, "target_archetypes", {}),
       listRows<{ asset_fk: string; achievement_fk: string }>(dbc, "asset_source_achievements", { includeArchived: true }),
-      listRows<{ collection_fk: string; asset_fk: string }>(dbc, "collection_assets", { includeArchived: true }),
+      listRows<{ id: string; collection_fk: string; asset_fk: string; version_fk: string; membership_stale_bool: boolean; membership_stale_reason: string }>(dbc, "collection_assets", { includeArchived: true }),
+      listRows<AssetVersion>(dbc, "asset_versions", { includeArchived: true }),
     ]);
-    return { assets, collections, achievements, archetypes, sourceLinks, memberships };
+    return { assets, collections, achievements, archetypes, sourceLinks, memberships, versions };
   }, []);
   const { data, loading, error } = useVaultData(loader);
   if (loading) return <p className="microlabel animate-pulse p-8">loading…</p>;
@@ -133,38 +134,78 @@ export default function AssetsPage() {
                   <span className="w-36 font-mono text-[10px] uppercase text-dim-400">{c.collection_type.replace("_", " ")}</span>
                   <span className="min-w-0 flex-1 truncate text-[13px] text-dim-100">{c.name}</span>
                   <span className="font-mono text-[10px] text-dim-500">{data.memberships.filter((m) => m.collection_fk === c.id).length} asset(s)</span>
+                  {data.memberships.some((m) => m.collection_fk === c.id && m.membership_stale_bool) && (
+                    <span className="font-mono text-[10px] uppercase text-signal-red" title="A packaged version or one of its sources changed">stale contents</span>
+                  )}
                   {c.approved_by_user_bool ? (
                     <span className="font-mono text-[10px] uppercase text-signal-green">approved</span>
                   ) : (
-                    <button className="btn-quiet" onClick={() => void updateRow(db, "asset_collections", c.id, { approved_by_user_bool: true, approved_at: new Date().toISOString() }).then(bump)}>approve</button>
+                    <button
+                      className="btn-quiet"
+                      onClick={async () => {
+                        try {
+                          await approveCollection(db, c.id);
+                        } catch (e) {
+                          window.alert(e instanceof AssetGateError ? e.message : "approval blocked");
+                        }
+                        bump();
+                      }}
+                    >
+                      approve
+                    </button>
                   )}
                   <button
                     className="btn-quiet"
+                    title="Re-check every packaged version against its current sources"
                     onClick={async () => {
-                      const name = window.prompt("Add which asset? (by source achievement name)");
-                      const link = data.sourceLinks.find((l) => (achName.get(l.achievement_fk) ?? "").toLowerCase() === name?.toLowerCase());
-                      if (!link) return;
+                      const invalid = await revalidateCollection(db, c.id);
+                      if (invalid > 0) window.alert(`${invalid} packaged version(s) are no longer valid.`);
+                      bump();
+                    }}
+                  >
+                    revalidate
+                  </button>
+                  <button
+                    className="btn-quiet"
+                    title="Collections package an exact approved version"
+                    onClick={async () => {
+                      const approved = data.versions.filter((v) => v.approved_by_user_bool && !v.blocked_bool);
+                      if (approved.length === 0) {
+                        window.alert("No approved versions yet — approve one first.");
+                        return;
+                      }
+                      const menu = approved
+                        .map((v) => `${achName.get(data.sourceLinks.find((l) => l.asset_fk === v.asset_fk)?.achievement_fk ?? "") ?? "asset"} v${v.version_number}`)
+                        .join("\n");
+                      const pick = window.prompt(`Package which approved version?\n${menu}`);
+                      const chosen = approved.find(
+                        (v) =>
+                          `${achName.get(data.sourceLinks.find((l) => l.asset_fk === v.asset_fk)?.achievement_fk ?? "") ?? "asset"} v${v.version_number}`.toLowerCase() ===
+                          pick?.toLowerCase(),
+                      );
+                      if (!chosen) return;
                       try {
-                        await addAssetToCollection(db, c.id, link.asset_fk);
+                        await addVersionToCollection(db, c.id, chosen.id);
                       } catch (e) {
                         window.alert(e instanceof AssetGateError ? e.message : "add failed");
                       }
                       bump();
                     }}
                   >
-                    + asset
+                    + version
                   </button>
                   {c.current_bool ? (
                     <span className="font-mono text-[10px] uppercase text-signal-green">current</span>
                   ) : (
                     <button
                       className="btn-quiet"
+                      title="Revalidates every packaged version before switching"
                       onClick={async () => {
-                        // one-current rule: clear the sibling first, then set.
-                        for (const sib of data.collections.filter((x) => x.collection_type === c.collection_type && x.current_bool)) {
-                          await updateRow(db, "asset_collections", sib.id, { current_bool: false });
+                        try {
+                          await setCurrentCollection(db, c.id);
+                        } catch (e) {
+                          window.alert(e instanceof AssetGateError ? e.message : "cannot become current");
                         }
-                        await updateRow(db, "asset_collections", c.id, { current_bool: true });
                         bump();
                       }}
                     >

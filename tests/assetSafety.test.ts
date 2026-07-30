@@ -2,12 +2,15 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { createBackend, type TestBackend } from "./backends";
 import {
-  addAssetToCollection,
+  addVersionToCollection,
+  approveCollection,
   approveVersion,
   AssetGateError,
   authorManualVersion,
+  dbGraphVerdict,
   logExternalUse,
   revalidateAsset,
+  setCurrentCollection,
 } from "../lib/assetService";
 import { generateAssetVersion } from "../lib/server/assetGeneration";
 import { buildPayloadManifest, gateGraph, resolveSourceGraph } from "../lib/sourceGraph";
@@ -18,6 +21,7 @@ import {
   createProject,
   quickLogAchievement,
   updateAchievement,
+  updateEvidenceItem,
 } from "../lib/repos";
 import type { AssetVersion, CareerAsset } from "../lib/entities";
 
@@ -41,6 +45,10 @@ afterAll(async () => {
   await backend.teardown();
 });
 beforeEach(async () => backend.cleanup());
+
+/** Raw superuser SQL (hermetic backend only) — used to prove that the guards
+ *  hold even on a privileged path that RLS does not constrain. */
+const rawSql = (q: string) => backend.sql!(q);
 
 const PRIVATE_RAW = "Confidential: premium-segment churn drop worth $47M ARR at DIRECTV";
 const SANITIZED = "Improved retention by multiple points on a major subscription segment";
@@ -85,11 +93,28 @@ async function seedEligibleAsset(db: SupabaseClient) {
     truth_status: "VERIFIED",
     privacy_class: "PUBLIC_SAFE",
   });
-  const asset = await createRow<CareerAsset>(db, "career_assets", { asset_type: "resume_bullet" });
+  const evidence = await createEvidenceItem(db, {
+    achievement_fk: pub.id,
+    type: "email_ref",
+    content_summary: "VP email confirming the Q2 result",
+    privacy_class: "PUBLIC_SAFE",
+    verified_at: new Date().toISOString(),
+    verified_by: "manager",
+  });
+  const archetype = await createRow<{ id: string }>(db, "target_archetypes", {
+    name: "Director, Analytics",
+    approved_by_user_bool: true,
+    required_skills: ["forecasting"],
+  });
+  const asset = await createRow<CareerAsset>(db, "career_assets", {
+    asset_type: "resume_bullet",
+    target_archetype_fk: archetype.id,
+  });
   await createRow(db, "asset_source_achievements", { asset_fk: asset.id, achievement_fk: pub.id });
   await createRow(db, "asset_source_achievements", { asset_fk: asset.id, achievement_fk: priv.id });
   await createRow(db, "asset_source_metrics", { asset_fk: asset.id, metric_fk: metric.id });
-  return { p, pub, priv, metric, asset };
+  await createRow(db, "asset_source_evidence", { asset_fk: asset.id, evidence_fk: evidence.id });
+  return { p, pub, priv, metric, evidence, archetype, asset };
 }
 
 describe("blocker #2 — exact outbound payload through the canonical source graph", () => {
@@ -117,7 +142,7 @@ describe("blocker #2 — exact outbound payload through the canonical source gra
     const gate = gateGraph(graph, { attestedNoMetricOverride: false });
     expect(gate.allowed).toBe(true);
     const manifest = buildPayloadManifest(graph, gate);
-    expect(manifest).toHaveLength(3); // pub achievement, sanitized substitution, metric
+    expect(manifest).toHaveLength(5); // achievement, sanitized substitution, metric, evidence, archetype
     expect(manifest.join("\n")).not.toContain(PRIVATE_RAW);
     const substituted = graph.sources.find((s) => s.substituted_claim_id);
     expect(substituted?.text).toContain(SANITIZED);
@@ -200,12 +225,14 @@ describe("blocker #3 — safety enforced through the full asset lifecycle", () =
     // the world changes: the verified claim becomes DISPUTED
     await updateAchievement(A, pub.id, { truth_status: "DISPUTED" });
     await expect(approveVersion(A, versionId)).rejects.toThrow(AssetGateError);
+    // the DATABASE independently reports the same verdict
+    expect((await dbGraphVerdict(A, asset.id)).eligible).toBe(false);
     const stale = await getRow<CareerAsset>(A, "career_assets", asset.id);
     expect(stale?.eligibility_stale_bool).toBe(true);
     expect(stale?.eligibility_reason).toMatch(/DISPUTED/);
-    await expect(logExternalUse(A, asset.id, "LinkedIn", 1)).rejects.toThrow(AssetGateError);
+    await expect(logExternalUse(A, versionId, "LinkedIn")).rejects.toThrow(AssetGateError);
     const coll = await createRow<{ id: string }>(A, "asset_collections", { name: "Resume v1", collection_type: "resume_version" });
-    await expect(addAssetToCollection(A, coll.id, asset.id)).rejects.toThrow(AssetGateError);
+    await expect(addVersionToCollection(A, coll.id, versionId)).rejects.toThrow(AssetGateError);
     // blocked lifecycle attempts are audited too
     const audits = await listRows<{ output_type: string; blocked_bool: boolean }>(A, "ai_outputs", { includeArchived: true });
     expect(audits.some((a) => a.output_type === "asset_approval" && a.blocked_bool)).toBe(true);
@@ -217,22 +244,25 @@ describe("blocker #3 — safety enforced through the full asset lifecycle", () =
     expect((await getRow<CareerAsset>(A, "career_assets", asset.id))?.eligibility_stale_bool).toBe(false);
     const approved = await approveVersion(A, versionId);
     expect(approved.approved_by_user_bool).toBe(true);
-    await logExternalUse(A, asset.id, "LinkedIn profile", 1);
+    await logExternalUse(A, versionId, "LinkedIn profile");
     const used = await getRow<CareerAsset>(A, "career_assets", asset.id);
-    expect(used?.used_externally_bool).toBe(true);
-    expect(used?.external_use_log).toHaveLength(1);
+    expect(used?.used_externally_bool).toBe(true); // derived by trigger
+    const uses = await listRows<{ version_fk: string; destination: string }>(A, "asset_external_uses", { includeArchived: true });
+    expect(uses).toEqual([expect.objectContaining({ version_fk: versionId, destination: "LinkedIn profile" })]);
   });
 
-  it("collection membership requires an approved version and goes through the junction", async () => {
+  it("collection membership references the EXACT approved version and requires approval", async () => {
     const { asset } = await seedEligibleAsset(A);
     const coll = await createRow<{ id: string }>(A, "asset_collections", { name: "Pack", collection_type: "interview_pack" });
-    await expect(addAssetToCollection(A, coll.id, asset.id)).rejects.toThrow(/approved version/);
     const { transport } = capturingTransport();
     const gen = await generateAssetVersion(A, asset.id, { transport });
+    await expect(addVersionToCollection(A, coll.id, gen.version!.id)).rejects.toThrow(/approved version/);
     await approveVersion(A, gen.version!.id);
-    await addAssetToCollection(A, coll.id, asset.id);
-    const members = await listRows<{ collection_fk: string; asset_fk: string }>(A, "collection_assets", { includeArchived: true });
-    expect(members).toEqual([expect.objectContaining({ collection_fk: coll.id, asset_fk: asset.id })]);
+    await addVersionToCollection(A, coll.id, gen.version!.id);
+    const members = await listRows<{ collection_fk: string; asset_fk: string; version_fk: string }>(A, "collection_assets", { includeArchived: true });
+    expect(members).toEqual([
+      expect.objectContaining({ collection_fk: coll.id, asset_fk: asset.id, version_fk: gen.version!.id }),
+    ]);
   });
 
   it("manual authoring revalidates the graph and derives privacy from it — not from authorship", async () => {
@@ -270,17 +300,32 @@ describe("blocker #4 — version-chain and junction integrity at the database", 
     expect(res.error?.message).toMatch(/same asset/);
   });
 
-  it("the DB rejects cross-asset supersession and supersession by an earlier version (cycles)", async () => {
+  it("supersession is server-only, and the integrity trigger still guards the privileged path", async () => {
     const { asset } = await seedEligibleAsset(A);
     const { transport } = capturingTransport();
     const v1 = (await generateAssetVersion(A, asset.id, { transport })).version!;
     const v2 = (await generateAssetVersion(A, asset.id, { transport })).version!;
     const otherAsset = await createRow<CareerAsset>(A, "career_assets", { asset_type: "story" });
     const foreign = await createRow<AssetVersion>(A, "asset_versions", { asset_fk: otherAsset.id, version_number: 1, content: "x" });
+
+    // Layer 1: a client cannot touch supersession at all.
     const cross = await A.from("asset_versions").update({ superseded_by_fk: foreign.id }).eq("id", v1.id).select();
-    expect(cross.error?.message).toMatch(/same asset/);
-    const cycle = await A.from("asset_versions").update({ superseded_by_fk: v1.id }).eq("id", v2.id).select();
-    expect(cycle.error?.message).toMatch(/LATER version/);
+    expect(cross.error?.message).toMatch(/only by the server/);
+
+    // Layer 2: even on the trusted path, cross-asset and backward (cycle)
+    // supersession are rejected by the integrity trigger.
+    await expect(
+      rawSql(`do $$ begin
+        perform set_config('ccc.trusted_path','on',true);
+        update public.asset_versions set superseded_by_fk = '${foreign.id}' where id = '${v1.id}';
+      end $$;`),
+    ).rejects.toThrow(/same asset/);
+    await expect(
+      rawSql(`do $$ begin
+        perform set_config('ccc.trusted_path','on',true);
+        update public.asset_versions set superseded_by_fk = '${v1.id}' where id = '${v2.id}';
+      end $$;`),
+    ).rejects.toThrow(/LATER version/);
   });
 
   it("junction rows cannot link another user's rows (composite same-user FK)", async () => {

@@ -1,15 +1,25 @@
 import { NextResponse } from "next/server";
 import { authUrl, googleConfigured } from "@/lib/server/google";
-import { newBinding, seal, stateCookie } from "@/lib/server/oauthState";
+import {
+  issueState,
+  newBinding,
+  OAUTH_PROVIDERS,
+  OAUTH_STATE_TTL_SECONDS,
+  seal,
+  stateCookie,
+  type OAuthProvider,
+} from "@/lib/server/oauthState";
 import { supabaseForRequest } from "@/lib/server/supabase";
 
 // Starts the OAuth consent flow. The initiating request is authenticated
 // server-side (Supabase session token in the Authorization header — never in
-// the URL); the state parameter is a single-use random nonce; the full
-// binding (user, provider, callback, PKCE verifier, session) lives only in
-// an encrypted HttpOnly cookie.
+// the URL). The state parameter is an opaque random nonce whose HASH is
+// persisted server-side as an unconsumed `oauth_states` row; the callback
+// claims that row atomically, which is what makes the state single-use. The
+// encrypted cookie carries the caller's session so the callback can act as
+// them — it is transport, not authority.
 
-const PROVIDERS = new Set(["gmail", "calendar"]);
+const PROVIDERS = new Set<string>(OAUTH_PROVIDERS);
 const NO_STORE = { "cache-control": "no-store" };
 
 export async function POST(req: Request) {
@@ -31,9 +41,16 @@ export async function POST(req: Request) {
   }
   const accessToken = (req.headers.get("authorization") ?? "").slice("Bearer ".length);
   const redirectUri = `${new URL(req.url).origin}/api/google/callback`;
-  const binding = newBinding(userData.user.id, provider as "gmail" | "calendar", redirectUri, accessToken);
+  const binding = newBinding(userData.user.id, provider as OAuthProvider, redirectUri, accessToken);
+  // Persist the single-use record BEFORE handing the nonce to the browser; if
+  // this fails there is no usable state and the flow never starts.
+  try {
+    await issueState(db, binding);
+  } catch {
+    return NextResponse.json({ error: "could not start the connection" }, { status: 500, headers: NO_STORE });
+  }
   const url = authUrl(binding.provider, redirectUri, binding.nonce, binding.codeVerifier);
   const res = NextResponse.json({ url }, { headers: NO_STORE });
-  res.headers.append("set-cookie", stateCookie(seal(binding), 600));
+  res.headers.append("set-cookie", stateCookie(seal(binding), OAUTH_STATE_TTL_SECONDS));
   return res;
 }

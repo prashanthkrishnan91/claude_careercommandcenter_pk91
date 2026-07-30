@@ -31,11 +31,11 @@ async function checkDef(table: string, fragment: string): Promise<boolean> {
 }
 
 describe("fresh migration chain", () => {
-  it("applies successfully and creates all 47 product tables", async () => {
+  it("applies successfully and creates all 49 product tables", async () => {
     const rows = await sql(
       "select count(*) as n from information_schema.tables where table_schema='public'",
     );
-    expect(Number(rows[0].n)).toBe(47);
+    expect(Number(rows[0].n)).toBe(49);
   });
 });
 
@@ -150,17 +150,37 @@ describe("security objects", () => {
   it("SECURITY DEFINER is confined to the maturity/override functions that must write client-read-only tables", async () => {
     // Justified definers: they write maturity_state / override_mutations /
     // owner_overrides, which clients can only read. Everything else is invoker.
+    // Each must write a client-read-only table, or be the authorization
+    // predicate that reads across tables the caller cannot see in full.
     const JUSTIFIED = [
       "ccc_set_override",
       "ccc_override_active",
       "ccc_p1_unlocked",
       "ccc_recompute_maturity",
       "ccc_log_override_mutation",
+      // authoritative boundaries
+      "ccc_issue_oauth_state",
+      "ccc_claim_oauth_state",
+      "ccc_purge_oauth_states",
+      "ccc_asset_graph_eligible",
+      "ccc_commit_asset_version",
+      "ccc_validate_external_use",
+      "ccc_sync_used_externally",
+      "ccc_log_external_use",
+      "ccc_approve_asset_version",
+      "ccc_validate_collection_member",
+      "ccc_revalidate_collection",
+      "ccc_approve_collection",
+      "ccc_set_current_collection",
+      "ccc_add_collection_version",
+      "ccc_propagate_source_change",
+      "ccc_maturity_criteria",
+      "ccc_maturity_met",
     ];
     const rows = await sql(
       `select proname, prosecdef, proconfig from pg_proc where proname like 'ccc_%'`,
     );
-    expect(rows.length).toBeGreaterThanOrEqual(9);
+    expect(rows.length).toBeGreaterThanOrEqual(28);
     for (const r of rows) {
       if (JUSTIFIED.includes(String(r.proname))) {
         expect(r.prosecdef, `${r.proname} definer`).toBe(true);
@@ -174,14 +194,18 @@ describe("security objects", () => {
   it("RLS is enabled on every public table; client-read-only tables carry only a select policy", async () => {
     // maturity_state and override_mutations are written exclusively by the
     // SECURITY DEFINER functions; owner_overrides only via ccc_set_override.
-    const READ_ONLY = ["maturity_state", "override_mutations", "owner_overrides"];
+    // Written exclusively by SECURITY DEFINER functions/triggers; clients read.
+    const READ_ONLY = [
+      "maturity_state", "override_mutations", "owner_overrides",
+      "oauth_states", "asset_external_uses",
+    ];
     const tables = await sql(
       `select c.relname, c.relrowsecurity,
               (select count(*) from pg_policy p where p.polrelid = c.oid) as policies
          from pg_class c join pg_namespace n on n.oid = c.relnamespace
         where n.nspname='public' and c.relkind='r'`,
     );
-    expect(tables.length).toBe(47);
+    expect(tables.length).toBe(49);
     for (const t of tables) {
       expect(t.relrowsecurity, `${t.relname} rls`).toBe(true);
       expect(Number(t.policies), `${t.relname} policies`).toBe(
@@ -208,6 +232,15 @@ describe("security objects", () => {
       "ccc_assets_current_version_check",
       "ccc_versions_supersession_check",
       "ccc_reference_use_gate",
+      // authoritative boundaries
+      "ccc_external_use_validate",
+      "ccc_external_use_sync",
+      "ccc_versions_guard",
+      "ccc_assets_guard",
+      "ccc_collections_guard",
+      "ccc_collection_member_validate",
+      "ccc_override_audit_immutable",
+      "ccc_ach_source_change",
     ]) {
       expect(names).toContain(t);
     }

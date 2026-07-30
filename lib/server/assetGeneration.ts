@@ -58,12 +58,17 @@ export async function generateAssetVersion(
 
   const truthSummary = [...new Set(graph.sources.map((s) => s.truth_status).filter(Boolean))].join(",");
   // PUBLIC_SAFE is DERIVED from the fully eligible source graph, never from
-  // the mere success of a generation call.
+  // the mere success of a generation call. The ATTESTED_NO_METRIC
+  // acknowledgment is recorded ON THE VERSION so later lifecycle steps
+  // (approval, packaging, external use) can honor the acknowledgment that was
+  // actually given at generation time instead of re-asking or silently
+  // assuming it.
   const version = await commitVersion(
     db, asset,
     { content: result.text.trim(), generated_by_model: result.model, generation_prompt_hash: promptHash(prompt) },
     "PUBLIC_SAFE",
     truthSummary,
+    graph.sources.some((s) => s.requires_no_metric_override) && (opts.attestedNoMetricOverride ?? false),
   );
   await audit(db, graph, outputType, { blocked: false, model: result.model, output: result.text.trim() });
   return { version };

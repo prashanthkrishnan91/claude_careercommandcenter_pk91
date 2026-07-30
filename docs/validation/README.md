@@ -1,16 +1,17 @@
 # Validation report
 
-## 1. Automated suites — 105 tests (run in this repo, output in BUILD_REPORT.md)
+## 1. Automated suites — 137 tests (run in this repo, output in BUILD_REPORT.md)
 
-- `tests/schema.test.ts` — fresh 4-migration chain applies from an empty
-  database (47 tables); exact canonical columns/enums/defaults; substituted
+- `tests/schema.test.ts` — fresh 5-migration chain applies from an empty
+  database (49 tables); exact canonical columns/enums/defaults; substituted
   values (`EVIDENCED`, `SENSITIVE`, `EXTERNAL_OK`, `COMPLETED`) rejected;
   composite same-user FKs on every relationship including all nine junction
-  tables + Gate 7's qualifying offer; SECURITY DEFINER confined to the exact
-  five-function maturity/override allowlist (pinned search_path); RLS on all
-  47 tables (×4 policies, ×1 select-only on the client-read-only tables);
-  grants; enforcement triggers (offer acceptance, Gate 7, version chain,
-  reference use, has_metric sync).
+  tables + Gate 7's qualifying offer; SECURITY DEFINER confined to an exact
+  allowlist, each with a pinned search_path; RLS on all 49 tables (×4
+  policies, ×1 select-only on the five client-read-only tables); grants;
+  enforcement triggers (offer acceptance, Gate 7, version chain, external-use
+  and collection validation, approval/current guards, reference use,
+  has_metric sync, append-only audit).
 - `tests/model.test.ts` — canonical zod schemas; promotion gate reasons;
   external-asset gate (incl. ATTESTED_NO_METRIC override); grader ceilings +
   director-signal (Ownership floor); visa gate math + market-motion menus;
@@ -30,6 +31,20 @@
   duplicate rejection.
 - `tests/filters.test.ts` — vault filter combinations; the status filter is
   matched (never stripped), plus truth/privacy/employer/date/candidate.
+- `tests/authoritativeBoundaries.test.ts` — the database refuses forged
+  transitions on its own, tested AROUND the TypeScript service layer:
+  atomic single-use OAuth claim (including eight concurrent claims where
+  exactly one wins, cross-user refusal, expiry, purge, and an assertion that
+  the claim is a single conditional UPDATE); transactional version commits
+  (concurrent commits produce a dense ordered chain; a forced failure rolls
+  back completely); version-exact external-use records with a trigger-derived
+  `used_externally_bool`; version-exact collections with RPC-only approval and
+  current selection, revalidation, and staleness propagation; the evidence
+  verification and approved-archetype policies with exact-payload checks and a
+  TS↔SQL parity matrix; live maturity (regression revokes P1 with no recompute
+  call; a forged `maturity_state` grants nothing); all twelve P1 tables
+  enforced with an append-only, reason-snapshotted override audit; and
+  direct-PostgREST bypass rejection for every safety-critical transition.
 - `tests/crud.test.ts` — behavior against the real migrations + RLS (PGlite
   hermetic; identical spec runs live with `TEST_LIVE=1`): CRUD/persistence,
   archive/restore, cross-user linking fails at the DB, spoofed user_id
@@ -66,7 +81,21 @@ acceptance (blocked first, accepted after), STAR story approval, archetype
 creation, asset generation blocked by the truth gate then generated via the
 deterministic stub transport (`CCC_AI_TRANSPORT=stub`, applied AFTER the
 real gate), version approval + external-use logging, Sunday Review brief,
-reference willingness enforcement (blocked → confirmed → recorded) — then
+reference willingness enforcement (blocked → confirmed → recorded).
+
+It then EXECUTES the remaining module workflows rather than probing their
+routes: a concurrent OAuth-claim race at the real storage boundary; grader
+evaluation persistence with 7 scored dimensions, rationales, the
+ATTESTED_NO_METRIC ceiling and a recorded dispute; a JD-derived archetype
+through approval, comparator and a persisted gap report; metric and evidence
+source-graph eligibility (unverified evidence refused with its exact reason,
+then cleared); a version-exact collection through membership → approval →
+current → invalidation by a regressed source; the full P1 relationship chain
+(company → contact → outreach → application → referral → interview →
+debrief, plus a rejected dangling link); comp benchmark, offer scenario and
+counter-proposal with its benchmark link; skill → linked evidence →
+development plan → progress → stale detection; the Monthly Board Review; and
+a maturity regression that revokes P1 writes with no recompute call. Then
 screenshots of every surface (`live/` artifacts) and cleanup.
 
 **Status: gated on GitHub Secrets** (`CCC_TEST_EMAIL_A`, `CCC_TEST_PASSWORD`)

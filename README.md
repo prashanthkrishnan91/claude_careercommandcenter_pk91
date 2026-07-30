@@ -33,7 +33,7 @@ v2.1.1 + v2.2 → v2.2.1 → v2.2.2). Full P0 + P1 in this repo:
 
 ```bash
 npm install
-npm test        # 105 tests: schema, logic, OAuth state, AI payload gating, behavior (real migrations in PGlite)
+npm test        # 137 tests: schema, logic, OAuth state, AI payload gating, database authority, behavior
 npm run dev
 npm run build
 ```

@@ -46,6 +46,24 @@ route, or canonical service) — not by hiding UI:
 | 9 | Regression gaps | 39 new behavioral tests (OAuth state, exact payload, lifecycle, version chain, offers/Gate 7, DB maturity + bypass + audit, filters) |
 | 10 | PR/report claims drifted from the code | This document and the PR body rewritten to the verified state only |
 
+## Authoritative-boundary pass (second semantic review)
+
+A follow-up review found that four rules lived in the database but were still
+reachable only through cooperative client code, and that maturity was a cached
+snapshot. Migration `20260730030000_authoritative_boundaries.sql` closes that:
+
+| # | Finding | Correction |
+|---|---|---|
+| 1 | Clearing a cookie is not replay prevention | Server-side `oauth_states` ledger (hashed nonce, provider, redirect, encrypted PKCE verifier + session binding, issued/expiry/consumed). `ccc_claim_oauth_state` claims it with ONE conditional UPDATE whose guard is in the WHERE clause, so concurrent callbacks contend on the row lock and exactly one wins — the cookie is irrelevant to the outcome. Documented 24-hour purge. |
+| 2 | `commitVersion` was several PostgREST calls | `ccc_commit_asset_version`: locks the asset, allocates the number, inserts, supersedes the open prior, repoints `current_version_fk`, derives truth/privacy — one transaction, full rollback on failure. Concurrency and forced-failure rollback tested. |
+| 3 | External use was mutable JSON with a caller-supplied version number | `asset_external_uses` table: version-exact, validated on insert (resolves, same asset+user, approved, unblocked, IS the current version, graph currently eligible). `used_externally_bool` is trigger-derived and rejected if set directly. |
+| 4 | Collections referenced abstract assets | `collection_assets.version_fk` — the exact approved version, same-user and same-asset enforced. Approval and current selection are RPC-only and revalidate contents; a later source change marks memberships stale; maturity requires the approved current collection's exact versions to be valid. |
+| 5 | Unverified evidence and unapproved archetypes could enter payloads | Canonical evidence-verification policy (`verified_at` + `verified_by` required — PUBLIC_SAFE is privacy, not proof) and approved-active archetype requirement, both in SQL and TypeScript, with exact-payload tests. Raw retained JD text never travels. |
+| 6 | `maturity_state` was refreshed only when the UI asked | `ccc_p1_unlocked` now evaluates `ccc_maturity_criteria` live; `maturity_state` is a display cache. Regressing a source revokes P1 writes on the next statement, and a forged cache cannot grant access. |
+| 7 | `comp_benchmarks` and the P1 junctions were unenforced; the audit could be re-read through a later reason | All twelve P1 tables enforced; `override_mutations` records INSERT/UPDATE/DELETE with the override event id and an immutable reason snapshot; both audit tables are append-only. |
+| 8 | Safety-critical writes went through generic `updateRow` | Approval, collection approve/current/membership and external use are RPC-only, with guard triggers rejecting the generic update. Direct-PostgREST bypass tests prove each refusal. |
+| 9 | Integration script probed route titles | 39 checks that execute the workflows — grader persistence/ceilings/dispute, JD archetype + comparator + persisted gap report, metric/evidence eligibility, version-exact collections through approval → current → invalidation, the full P1 relationship chain, benchmark + scenario + counter, skills → evidence → plan → progress → stale, Monthly Board, maturity regression, and a concurrent OAuth-claim race at the real storage boundary. |
+
 ## Stack
 
 Next.js 15 (App Router, TS, Tailwind; client data layer over
@@ -58,7 +76,7 @@ vendored from npm.
 
 ## Schema
 
-Four-migration chain, applied identically to the remote project and loaded
+Five-migration chain, applied identically to the remote project and loaded
 verbatim by the hermetic suite (drift breaks tests):
 
 1. `20260730000100_p0a_canonical_schema.sql` — the four canonical entities.
@@ -84,8 +102,17 @@ verbatim by the hermetic suite (drift breaks tests):
    found running the full chain from empty: `date - bigint` cast, composite
    SET NULL column list, Gate-7 regression when its offer disappears,
    unreachable acceptance branch folded, override-audit NULL guard.
+5. `20260730030000_authoritative_boundaries.sql` — `oauth_states` (atomic
+   single-use claim), `asset_external_uses` (version-exact records; the
+   mutable `external_use_log` JSON column is dropped),
+   `collection_assets.version_fk`, `ccc_asset_graph_eligible` (the source
+   rules in SQL, incl. the evidence-verification policy and approved-archetype
+   requirement), `ccc_commit_asset_version`, the approval / collection /
+   external-use RPCs with their guard triggers, live maturity
+   (`ccc_maturity_criteria` inside `ccc_p1_unlocked`), full P1 coverage and the
+   durable override audit.
 
-47 public tables. Every table: `user_id` default `auth.uid()`, RLS scoped to
+49 public tables. Every table: `user_id` default `auth.uid()`, RLS scoped to
 the user, and **composite same-user foreign keys** — a child row's
 `(fk, user_id)` must match a parent owned by the same user, so cross-user
 linking fails in the database, not in application code. Enforcement objects:
@@ -93,13 +120,13 @@ sanitized-claim approval ⇒ PUBLIC_SAFE (check), attorney-gated visa states
 (check), one current resume/profile collection (partial unique index),
 offer-acceptance + Gate-7 triggers (insert AND update), version-chain
 triggers (same-asset current version, no cross-asset or backward
-supersession), reference-willingness trigger, `has_metric_bool` sync
-trigger. `ccc_*` functions are invoker-rights except five justified
-SECURITY DEFINER functions (`ccc_set_override`, `ccc_override_active`,
-`ccc_p1_unlocked`, `ccc_recompute_maturity`, `ccc_log_override_mutation`)
-that must write the client-read-only maturity/override tables; each pins
-`search_path` and is scoped to `auth.uid()`. The schema test enforces this
-exact allowlist.
+supersession), external-use and collection-membership validation triggers,
+guard triggers on approval / current selection / derived flags,
+reference-willingness trigger, `has_metric_bool` sync trigger, append-only
+audit triggers. `ccc_*` functions are invoker-rights except the SECURITY
+DEFINER set that must write client-read-only tables or act as the
+authorization predicate; each pins `search_path` and is scoped to
+`auth.uid()`. The schema test enforces the exact allowlist.
 
 ## Security remediation (from the correction mandate)
 
@@ -135,6 +162,7 @@ exact allowlist.
 | 6 | Apply `full_product_schema` | success (36 public tables) |
 | 7 | Apply `integrity_and_enforcement` (junctions, triggers, maturity) | success (47 public tables) |
 | 8 | Apply `enforcement_corrections` (fixes found by the hermetic chain) | success |
+| 9 | Apply `authoritative_boundaries` in six parts (OAuth ledger, SQL graph gate, transactional commits + external-use records, version-exact collections, live maturity, P1 coverage + grants) | success (49 public tables; verified to match the hermetic chain) |
 
 Travel and Finance Supabase projects were not touched at any point.
 (Housekeeping note from the previous iteration remains: the paused travel
@@ -144,24 +172,25 @@ project existed; drop SQL is in the PR discussion. Pre-existing advisory:
 
 ## Verification evidence
 
-### Automated suites — 105 passing
+### Automated suites — 137 passing
 
 ```
 behavior suite backend: pglite (hermetic, real migrations + RLS)
 
- ✓ tests/model.test.ts       (24 tests)
- ✓ tests/filters.test.ts      (7 tests)
- ✓ tests/oauthState.test.ts  (14 tests)
- ✓ tests/schema.test.ts      (16 tests)
- ✓ tests/assetSafety.test.ts (14 tests)
- ✓ tests/crud.test.ts        (30 tests)
+ ✓ tests/model.test.ts                  (24 tests)
+ ✓ tests/filters.test.ts                 (7 tests)
+ ✓ tests/oauthState.test.ts             (14 tests)
+ ✓ tests/schema.test.ts                 (16 tests)
+ ✓ tests/assetSafety.test.ts            (14 tests)
+ ✓ tests/crud.test.ts                   (30 tests)
+ ✓ tests/authoritativeBoundaries.test.ts (32 tests)
 
- Test Files  6 passed (6)
-      Tests  105 passed (105)
+ Test Files  7 passed (7)
+      Tests  137 passed (137)
 ```
 
 Coverage map against the test contract: full migration chain from an empty
-database (47 tables) ✓ · canonical schema/constraints ✓ · RLS + cross-user
+database (49 tables) ✓ · canonical schema/constraints ✓ · RLS + cross-user
 isolation (including junction tables) ✓ · archive/restore ✓ ·
 hierarchy/persistence ✓ · OAuth state security (no sensitive data in
 state/URL, tamper/expiry/replay/nonce/provider/key-rotation rejection,
@@ -176,11 +205,27 @@ rejected at RLS + override reason/logging/audit ✓ · offer acceptance on
 INSERT and UPDATE + Gate-7 specific-offer relationship ✓ · reference
 willingness via junction ✓ · vault filter combinations (status never
 stripped) ✓ · quick-log defaults ✓ · no product
-delete/export/PDF/LinkedIn-automation code ✓ · spoofed user_id ✓.
+delete/export/PDF/LinkedIn-automation code ✓ · spoofed user_id ✓ ·
+**atomic single-use OAuth claim under concurrency** ✓ · **transactional
+version commits (concurrency + forced-failure rollback)** ✓ · **version-exact
+external-use records with a derived flag** ✓ · **version-exact collections
+with revalidation on approve/current and staleness propagation** ✓ ·
+**evidence-verification and approved-archetype policy, in SQL and TS, pinned
+to agreement by a parity test** ✓ · **live maturity: regression revokes P1
+without a recompute, and a forged cache grants nothing** ✓ · **all twelve P1
+tables enforced; INSERT/UPDATE/DELETE audited with an immutable reason
+snapshot; audit tables append-only** ✓ · **direct-PostgREST bypass rejected
+for approval, collection membership/approval/current, and external use** ✓.
 
 ### Build
 
 `next build` clean — 30 routes.
+
+### Migration chain from empty
+
+Re-applied file-by-file into a fresh in-process Postgres: all five migrations
+apply cleanly and produce 49 tables — the same count the remote project
+reports after the identical files were applied there.
 
 ### Visual proof
 

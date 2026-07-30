@@ -232,6 +232,7 @@ describe("visa gating", () => {
       id: `${g.ordinal}`,
       user_id: "u",
       status: completed.includes(g.ordinal) ? "complete" : "not_started",
+      qualifying_offer_fk: null,
       assumptions: [],
       risks: [],
       required_documents: [],

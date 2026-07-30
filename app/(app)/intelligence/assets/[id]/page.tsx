@@ -12,7 +12,7 @@ import { getRow, listRows } from "@/lib/genericRepo";
 import { useVaultData } from "@/lib/hooks";
 import { getAchievement } from "@/lib/repos";
 import { getSupabase } from "@/lib/supabase";
-import type { AssetVersion, CareerAsset } from "@/lib/entities";
+import type { AssetExternalUse, AssetVersion, CareerAsset } from "@/lib/entities";
 import type { Achievement } from "@/lib/types";
 
 // Asset detail: versioned, append-only history with approval gating,
@@ -45,7 +45,13 @@ export default function AssetDetailPage() {
         const a = await getAchievement(dbc, link.achievement_fk);
         if (a) sources.push(a);
       }
-      return { asset, versions, sources };
+      const uses = await listRows<AssetExternalUse>(dbc, "asset_external_uses", {
+        eq: { asset_fk: id },
+        includeArchived: true,
+        orderBy: "used_at",
+        ascending: false,
+      });
+      return { asset, versions, sources, uses };
     },
     [id],
   );
@@ -141,15 +147,15 @@ export default function AssetDetailPage() {
                         Approve
                       </button>
                     )}
-                    {v.approved_by_user_bool && (
+                    {v.approved_by_user_bool && v.id === asset.current_version_fk && (
                       <button
                         className="btn-quiet"
-                        title="Log an external use of this approved version"
+                        title="Log an external use of this approved current version"
                         onClick={async () => {
                           const destination = window.prompt("Where was this used? (application, LinkedIn, …)");
                           if (!destination) return;
                           try {
-                            await logExternalUse(db, asset.id, destination, v.version_number);
+                            await logExternalUse(db, v.id, destination);
                           } catch (e) {
                             setNotice(e instanceof AssetGateError ? e.message : "external use blocked");
                           }
@@ -182,14 +188,14 @@ export default function AssetDetailPage() {
           </div>
         </section>
 
-        {asset.external_use_log.length > 0 && (
+        {data.uses.length > 0 && (
           <section>
-            <h2 className="microlabel mb-2">external use log</h2>
+            <h2 className="microlabel mb-2">external use log · immutable records, version-exact</h2>
             <ul className="panel divide-y divide-ink-700/70">
-              {asset.external_use_log.map((u, i) => (
-                <li key={i} className="flex gap-3 px-4 py-2 font-mono text-[11px] text-dim-300">
-                  <span>{u.at.slice(0, 10)}</span>
-                  <span>v{u.version}</span>
+              {data.uses.map((u) => (
+                <li key={u.id} className="flex gap-3 px-4 py-2 font-mono text-[11px] text-dim-300">
+                  <span>{u.used_at.slice(0, 10)}</span>
+                  <span>v{data.versions.find((v) => v.id === u.version_fk)?.version_number ?? "?"}</span>
                   <span className="text-dim-400">{u.destination}</span>
                 </li>
               ))}

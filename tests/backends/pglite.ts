@@ -10,6 +10,7 @@ const MIGRATIONS = [
   path.resolve(__dirname, "../../supabase/migrations/20260730002000_full_product_schema.sql"),
   path.resolve(__dirname, "../../supabase/migrations/20260730010000_integrity_and_enforcement.sql"),
   path.resolve(__dirname, "../../supabase/migrations/20260730020000_enforcement_corrections.sql"),
+  path.resolve(__dirname, "../../supabase/migrations/20260730030000_authoritative_boundaries.sql"),
 ];
 
 // Minimal PostgREST-style query builder over PGlite, covering exactly the
@@ -240,7 +241,10 @@ export async function createPgliteBackend(): Promise<TestBackend> {
     },
     async cleanup() {
       await pg.exec(`
+        alter table public.override_mutations disable trigger ccc_override_audit_immutable;
+        alter table public.owner_overrides disable trigger ccc_owner_overrides_immutable;
         delete from public.override_mutations; delete from public.maturity_state;
+        delete from public.oauth_states; delete from public.asset_external_uses;
         delete from public.asset_source_achievements; delete from public.asset_source_evidence;
         delete from public.asset_source_metrics; delete from public.collection_assets;
         delete from public.story_achievements; delete from public.story_archetypes;
@@ -265,6 +269,8 @@ export async function createPgliteBackend(): Promise<TestBackend> {
         delete from public.grader_evaluations; delete from public.sanitized_claims;
         delete from public.evidence_items; delete from public.metrics;
         delete from public.achievements; delete from public.projects;
+        alter table public.override_mutations enable trigger ccc_override_audit_immutable;
+        alter table public.owner_overrides enable trigger ccc_owner_overrides_immutable;
       `);
     },
     async teardown() {

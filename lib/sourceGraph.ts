@@ -4,19 +4,35 @@ import { getRow, listRows } from "./genericRepo";
 import { getAchievement, getEvidenceItem, getMetric } from "./repos";
 import type { PrivacyClass, TruthStatus } from "./types";
 
-// Canonical source-resolution service. EVERY external-asset flow (generation,
-// manual authoring, approval, collection membership, external-use logging,
-// maturity hygiene) resolves the asset's complete source graph through this
-// module: explicitly selected achievements, metrics, and evidence (normalized
-// junction tables), approved sanitized-claim substitutions, and archetype
-// context. Each source is classified by ITS OWN truth/privacy rules; missing
-// or dangling references block rather than silently disappear.
+// Canonical source-resolution service. It builds the outbound PAYLOAD; the
+// database function `ccc_asset_graph_eligible` is the AUTHORITY for the same
+// rules and gates every lifecycle transition (approval, collection membership,
+// external use) regardless of what any client believes. The two implement one
+// policy and are pinned to agreement by tests/graphParity.test.ts.
+//
+// Each source is classified by ITS OWN truth/privacy rules; missing or dangling
+// references block rather than silently disappear.
+//
+// EVIDENCE VERIFICATION POLICY (canonical): an evidence item enters an external
+// payload only when it is active, PUBLIC_SAFE, AND carries both a verification
+// timestamp and a verifier. PUBLIC_SAFE is a privacy statement, not a proof
+// statement — unverified evidence is exactly the material that must not be put
+// in front of an external audience.
+//
+// ARCHETYPE POLICY: targeting an archetype requires that archetype to be active
+// and user-approved. Only approved parsed configuration travels; raw retained
+// JD text (archetype_sources.raw_content) never enters a payload.
 
 export const EXTERNAL_ELIGIBLE_TRUTH: TruthStatus[] = [
   "VERIFIED",
   "ATTESTED_WITH_METRIC",
   "ATTESTED_NO_METRIC",
 ];
+
+/** The canonical evidence-verification predicate (one definition, used twice). */
+export function evidenceIsVerified(e: { verified_at: string | null; verified_by: string | null }): boolean {
+  return e.verified_at !== null && Boolean(e.verified_by);
+}
 
 export interface ResolvedSource {
   kind: "achievement" | "metric" | "evidence_item" | "archetype";
@@ -132,8 +148,11 @@ export async function resolveSourceGraph(db: SupabaseClient, assetId: string): P
       sources.push({ ...base, substituted_claim_id: null, text: "", eligible: false, reason: "Source evidence is archived.", requires_no_metric_override: false });
     } else if (e.privacy_class !== "PUBLIC_SAFE") {
       sources.push({ ...base, substituted_claim_id: null, text: "", eligible: false, reason: `Evidence privacy ${e.privacy_class} blocks external use.`, requires_no_metric_override: false });
+    } else if (!evidenceIsVerified(e)) {
+      // PUBLIC_SAFE is not proof: unverified evidence never reaches a payload.
+      sources.push({ ...base, substituted_claim_id: null, text: "", eligible: false, reason: "Unverified evidence cannot enter an external payload. Record who verified it and when.", requires_no_metric_override: false });
     } else {
-      sources.push({ ...base, substituted_claim_id: null, text: `Evidence (${e.type}${e.verified_by ? `, verified by ${e.verified_by}` : ""}): ${e.content_summary}`, eligible: true, reason: "", requires_no_metric_override: false });
+      sources.push({ ...base, substituted_claim_id: null, text: `Evidence (${e.type}, verified by ${e.verified_by}): ${e.content_summary}`, eligible: true, reason: "", requires_no_metric_override: false });
     }
   }
 
@@ -141,8 +160,13 @@ export async function resolveSourceGraph(db: SupabaseClient, assetId: string): P
     const arch = await getRow<TargetArchetype>(db, "target_archetypes", asset.target_archetype_fk);
     if (!arch) {
       sources.push({ kind: "archetype", id: asset.target_archetype_fk, label: "(missing archetype)", substituted_claim_id: null, text: "", eligible: false, reason: "Dangling reference: target archetype no longer resolves.", requires_no_metric_override: false });
+    } else if (arch.status === "archived") {
+      sources.push({ kind: "archetype", id: arch.id, label: arch.name, substituted_claim_id: null, text: "", eligible: false, reason: "Target archetype is archived.", requires_no_metric_override: false });
+    } else if (!arch.approved_by_user_bool) {
+      sources.push({ kind: "archetype", id: arch.id, label: arch.name, substituted_claim_id: null, text: "", eligible: false, reason: "Target archetype must be user-approved before it can shape an external asset.", requires_no_metric_override: false });
     } else {
-      // Archetype context is user-authored public-source configuration.
+      // Only APPROVED PARSED configuration travels. Raw retained JD text
+      // (archetype_sources.raw_content) is never read here by construction.
       sources.push({ kind: "archetype", id: arch.id, label: arch.name, substituted_claim_id: null, text: `Target role context: ${arch.name}. Emphasize: ${arch.required_skills.join(", ")}.`, eligible: true, reason: "", requires_no_metric_override: false });
     }
   }

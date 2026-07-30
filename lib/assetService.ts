@@ -1,20 +1,33 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import type { AssetVersion, CareerAsset } from "./entities";
-import { createRow, getRow, listRows, updateRow } from "./genericRepo";
+import { createRow, updateRow } from "./genericRepo";
 import { classifications, gateGraph, resolveSourceGraph, type GraphGate, type SourceGraph } from "./sourceGraph";
 
-// Full asset lifecycle with safety revalidation at EVERY boundary:
-// manual authoring, approval, collection membership, and external-use
-// logging all re-resolve the complete source graph (generation lives in
-// lib/server/assetGeneration.ts — server-only, same gate). Every attempt —
-// blocked, unavailable, transport failure, success, approval, external-use
-// rejection/success — is persisted to ai_outputs.
+// Asset lifecycle. Every SAFETY-CRITICAL transition — version commit,
+// approval, collection membership/approval/current selection, external-use
+// logging — is performed by a database function that re-derives eligibility
+// from `ccc_asset_graph_eligible` inside one transaction. This module calls
+// those functions; it never carries the decision itself, so a direct
+// PostgREST call cannot reach a different outcome than the UI.
 
 export class AssetGateError extends Error {
   constructor(readonly reasons: GraphGate["reasons"]) {
     super(`blocked: ${reasons.map((r) => `${r.label}: ${r.reason}`).join(" | ")}`);
     this.name = "AssetGateError";
   }
+}
+
+/** Reasons reported by the database gate, in the shape the UI already renders. */
+export interface DbVerdict {
+  eligible: boolean;
+  requires_ack: boolean;
+  reasons: GraphGate["reasons"];
+}
+
+export async function dbGraphVerdict(db: SupabaseClient, assetId: string): Promise<DbVerdict> {
+  const { data, error } = await db.rpc("ccc_asset_graph_eligible", { p_asset: assetId });
+  if (error) throw new Error(error.message);
+  return data as DbVerdict;
 }
 
 export async function audit(
@@ -41,7 +54,11 @@ async function markStale(db: SupabaseClient, assetId: string, gate: GraphGate): 
   });
 }
 
-/** Re-resolves the graph, persists staleness, returns the verdict. */
+/**
+ * Re-resolves the graph for payload building and persists staleness. The
+ * verdict returned here is advisory for the UI — the database re-derives it
+ * independently inside every lifecycle RPC.
+ */
 export async function revalidateAsset(
   db: SupabaseClient,
   assetId: string,
@@ -53,33 +70,28 @@ export async function revalidateAsset(
   return { graph, gate };
 }
 
-async function nextVersionNumber(db: SupabaseClient, assetId: string): Promise<number> {
-  const versions = await listRows<AssetVersion>(db, "asset_versions", { eq: { asset_fk: assetId }, includeArchived: true });
-  return versions.reduce((m, v) => Math.max(m, v.version_number), 0) + 1;
-}
-
-/** Version chain step: insert new → supersede open priors → repoint current. */
+/** Transactional version commit: lock → allocate → insert → supersede → repoint. */
 export async function commitVersion(
   db: SupabaseClient,
   asset: CareerAsset,
   values: Partial<AssetVersion> & { content?: string },
   derivedPrivacy: string | null,
   truthSummary: string,
+  ack = false,
 ): Promise<AssetVersion> {
-  const versionNumber = await nextVersionNumber(db, asset.id);
-  const version = await createRow<AssetVersion>(db, "asset_versions", { asset_fk: asset.id, version_number: versionNumber, ...values });
-  if (!values.blocked_bool) {
-    const priors = await listRows<AssetVersion>(db, "asset_versions", { eq: { asset_fk: asset.id }, includeArchived: true });
-    for (const p of priors.filter((p) => p.id !== version.id && !p.superseded_by_fk && !p.blocked_bool)) {
-      await updateRow(db, "asset_versions", p.id, { superseded_by_fk: version.id });
-    }
-    await updateRow(db, "career_assets", asset.id, {
-      current_version_fk: version.id,
-      truth_status_summary: truthSummary,
-      ...(derivedPrivacy ? { privacy_class: derivedPrivacy } : {}),
-    });
-  }
-  return version;
+  const { data, error } = await db.rpc("ccc_commit_asset_version", {
+    p_asset: asset.id,
+    p_content: values.content ?? "",
+    p_model: values.generated_by_model ?? "",
+    p_prompt_hash: values.generation_prompt_hash ?? "",
+    p_blocked: values.blocked_bool ?? false,
+    p_block_reason: values.block_reason ?? "",
+    p_privacy: derivedPrivacy,
+    p_truth_summary: truthSummary,
+    p_ack: ack,
+  });
+  if (error) throw new Error(error.message);
+  return data as AssetVersion;
 }
 
 export async function authorManualVersion(db: SupabaseClient, assetId: string, content: string): Promise<AssetVersion> {
@@ -90,42 +102,69 @@ export async function authorManualVersion(db: SupabaseClient, assetId: string, c
   return version;
 }
 
+function gateErrorFrom(message: string, verdict?: DbVerdict): never {
+  if (verdict && !verdict.eligible) throw new AssetGateError(verdict.reasons);
+  throw new AssetGateError([{ kind: "asset", id: "", label: "asset", reason: message }]);
+}
+
 export async function approveVersion(db: SupabaseClient, versionId: string): Promise<AssetVersion> {
-  const version = await getRow<AssetVersion>(db, "asset_versions", versionId);
-  if (!version) throw new Error("version not found");
-  if (version.blocked_bool) throw new Error("a blocked version cannot be approved");
-  const { graph, gate } = await revalidateAsset(db, version.asset_fk);
-  if (!gate.allowed) {
-    await audit(db, graph, "asset_approval", { blocked: true, reason: gate.reasons.map((r) => `${r.label}: ${r.reason}`).join(" | ") });
-    throw new AssetGateError(gate.reasons);
+  const { data, error } = await db.rpc("ccc_approve_asset_version", { p_version: versionId });
+  if (error) {
+    // surface the database's own per-source reasons rather than a raw error
+    const version = await db.from("asset_versions").select("asset_fk").eq("id", versionId).maybeSingle();
+    const assetFk = (version.data as { asset_fk?: string } | null)?.asset_fk;
+    const verdict = assetFk ? await dbGraphVerdict(db, assetFk) : undefined;
+    if (assetFk) {
+      const graph = await resolveSourceGraph(db, assetFk).catch(() => null);
+      await audit(db, graph, "asset_approval", { blocked: true, reason: error.message });
+    }
+    gateErrorFrom(error.message, verdict);
   }
-  const approved = await updateRow<AssetVersion>(db, "asset_versions", versionId, {
-    approved_by_user_bool: true,
-    approved_at: new Date().toISOString(),
-  });
-  await audit(db, graph, "asset_approval", { blocked: false, output: `approved v${version.version_number}` });
+  const approved = data as AssetVersion;
+  const graph = await resolveSourceGraph(db, approved.asset_fk).catch(() => null);
+  await audit(db, graph, "asset_approval", { blocked: false, output: `approved v${approved.version_number}` });
   return approved;
 }
 
-export async function logExternalUse(db: SupabaseClient, assetId: string, destination: string, versionNumber: number): Promise<void> {
-  const { graph, gate } = await revalidateAsset(db, assetId);
-  if (!gate.allowed) {
-    await audit(db, graph, "asset_external_use", { blocked: true, reason: gate.reasons.map((r) => `${r.label}: ${r.reason}`).join(" | ") });
-    throw new AssetGateError(gate.reasons);
+export async function logExternalUse(db: SupabaseClient, versionId: string, destination: string): Promise<void> {
+  const { error } = await db.rpc("ccc_log_external_use", { p_version: versionId, p_destination: destination });
+  if (error) {
+    const version = await db.from("asset_versions").select("asset_fk").eq("id", versionId).maybeSingle();
+    const assetFk = (version.data as { asset_fk?: string } | null)?.asset_fk;
+    const verdict = assetFk ? await dbGraphVerdict(db, assetFk) : undefined;
+    if (assetFk) {
+      const graph = await resolveSourceGraph(db, assetFk).catch(() => null);
+      await audit(db, graph, "asset_external_use", { blocked: true, reason: error.message });
+    }
+    gateErrorFrom(error.message, verdict);
   }
-  await updateRow(db, "career_assets", assetId, {
-    used_externally_bool: true,
-    external_use_log: [...graph.asset.external_use_log, { at: new Date().toISOString(), destination, version: versionNumber }],
-  });
+  const version = await db.from("asset_versions").select("asset_fk").eq("id", versionId).maybeSingle();
+  const assetFk = (version.data as { asset_fk?: string } | null)?.asset_fk;
+  const graph = assetFk ? await resolveSourceGraph(db, assetFk).catch(() => null) : null;
   await audit(db, graph, "asset_external_use", { blocked: false, output: destination });
 }
 
-export async function addAssetToCollection(db: SupabaseClient, collectionId: string, assetId: string): Promise<void> {
-  const { gate } = await revalidateAsset(db, assetId);
-  if (!gate.allowed) throw new AssetGateError(gate.reasons);
-  const versions = await listRows<AssetVersion>(db, "asset_versions", { eq: { asset_fk: assetId }, includeArchived: true });
-  if (!versions.some((v) => v.approved_by_user_bool)) {
-    throw new AssetGateError([{ kind: "asset", id: assetId, label: "asset", reason: "Only assets with an approved version can join a collection." }]);
-  }
-  await createRow(db, "collection_assets", { collection_fk: collectionId, asset_fk: assetId });
+/** Collections package an EXACT approved version, validated by the database. */
+export async function addVersionToCollection(db: SupabaseClient, collectionId: string, versionId: string): Promise<void> {
+  const { error } = await db.rpc("ccc_add_collection_version", {
+    p_collection: collectionId,
+    p_version: versionId,
+  });
+  if (error) gateErrorFrom(error.message);
+}
+
+export async function approveCollection(db: SupabaseClient, collectionId: string): Promise<void> {
+  const { error } = await db.rpc("ccc_approve_collection", { p_collection: collectionId });
+  if (error) gateErrorFrom(error.message);
+}
+
+export async function setCurrentCollection(db: SupabaseClient, collectionId: string): Promise<void> {
+  const { error } = await db.rpc("ccc_set_current_collection", { p_collection: collectionId });
+  if (error) gateErrorFrom(error.message);
+}
+
+export async function revalidateCollection(db: SupabaseClient, collectionId: string): Promise<number> {
+  const { data, error } = await db.rpc("ccc_revalidate_collection", { p_collection: collectionId });
+  if (error) throw new Error(error.message);
+  return (data as { invalid: number }).invalid;
 }
