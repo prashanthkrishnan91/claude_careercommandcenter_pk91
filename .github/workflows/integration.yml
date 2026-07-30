@@ -25,12 +25,15 @@ jobs:
         env:
           A: ${{ secrets.CCC_TEST_EMAIL_A }}
           P: ${{ secrets.CCC_TEST_PASSWORD }}
+          # Version creation is a server-only operation; without this key the
+          # generation and manual-version routes answer 503 by design.
+          S: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
-          if [ -n "$A" ] && [ -n "$P" ]; then
+          if [ -n "$A" ] && [ -n "$P" ] && [ -n "$S" ]; then
             echo "configured=true" >> "$GITHUB_OUTPUT"
           else
             echo "configured=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::CCC_TEST_EMAIL_A / CCC_TEST_PASSWORD are not configured; the browser job is skipped on push and fails closed on dispatch."
+            echo "::warning::CCC_TEST_EMAIL_A / CCC_TEST_PASSWORD / SUPABASE_SERVICE_ROLE_KEY are not all configured; the browser job is skipped on push and fails closed on dispatch."
           fi
 
   browser:
@@ -47,9 +50,10 @@ jobs:
         env:
           A: ${{ secrets.CCC_TEST_EMAIL_A }}
           P: ${{ secrets.CCC_TEST_PASSWORD }}
+          S: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
-          if [ -z "$A" ] || [ -z "$P" ]; then
-            echo "::error::CCC_TEST_EMAIL_A / CCC_TEST_PASSWORD secrets are required. Refusing to run."
+          if [ -z "$A" ] || [ -z "$P" ] || [ -z "$S" ]; then
+            echo "::error::CCC_TEST_EMAIL_A, CCC_TEST_PASSWORD and SUPABASE_SERVICE_ROLE_KEY secrets are all required. Refusing to run."
             exit 1
           fi
       - run: npm ci
@@ -59,8 +63,15 @@ jobs:
         # CCC_AI_TRANSPORT=stub: deterministic canned transport, applied AFTER
         # the real source-graph gate — generation flows are testable without a
         # provider credential and produce clearly-labeled "[stub]" content.
+        #
+        # SUPABASE_SERVICE_ROLE_KEY goes to the SERVER PROCESS ONLY. It has no
+        # NEXT_PUBLIC_ prefix, so it is never inlined into a browser bundle,
+        # and it is deliberately not exposed to the Playwright step below —
+        # the script drives the app as a real user, through the protected
+        # routes, exactly as a browser would.
         env:
           CCC_AI_TRANSPORT: stub
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: npm run start -- -p 3100 &
       - name: Wait for server
         run: |
