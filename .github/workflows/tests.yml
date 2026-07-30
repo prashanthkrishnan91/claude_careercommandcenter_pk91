@@ -1,0 +1,53 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  hermetic:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Hermetic suite (real migrations + RLS in PGlite)
+        run: npm test
+      - name: Production build
+        run: npm run build
+
+  # Live suite: signs in to the real Supabase project as the two dedicated CI
+  # accounts. Credentials come exclusively from GitHub Secrets and the job
+  # fails closed when any are absent. Manual dispatch only, so concurrent
+  # pushes can't interleave against the shared accounts.
+  live:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Fail closed without secrets
+        env:
+          A: ${{ secrets.CCC_TEST_EMAIL_A }}
+          B: ${{ secrets.CCC_TEST_EMAIL_B }}
+          P: ${{ secrets.CCC_TEST_PASSWORD }}
+        run: |
+          if [ -z "$A" ] || [ -z "$B" ] || [ -z "$P" ]; then
+            echo "::error::CCC_TEST_EMAIL_A / CCC_TEST_EMAIL_B / CCC_TEST_PASSWORD secrets are required. Refusing to run."
+            exit 1
+          fi
+      - run: npm ci
+      - name: Live behavior suite against Supabase
+        env:
+          TEST_LIVE: "1"
+          CCC_TEST_EMAIL_A: ${{ secrets.CCC_TEST_EMAIL_A }}
+          CCC_TEST_EMAIL_B: ${{ secrets.CCC_TEST_EMAIL_B }}
+          CCC_TEST_PASSWORD: ${{ secrets.CCC_TEST_PASSWORD }}
+        run: npm run test:crud

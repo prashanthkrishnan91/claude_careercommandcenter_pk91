@@ -1,0 +1,52 @@
+name: integration
+
+# Real end-to-end browser validation against the dedicated Supabase project:
+# real sign-in through the auth UI, no interception of Supabase requests.
+# Populates a deterministic demonstration dataset, screenshots every principal
+# surface (desktop + mobile), verifies the critical flows, cleans up after
+# itself, and uploads the screenshots as artifacts.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  browser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Fail closed without secrets
+        env:
+          A: ${{ secrets.CCC_TEST_EMAIL_A }}
+          P: ${{ secrets.CCC_TEST_PASSWORD }}
+        run: |
+          if [ -z "$A" ] || [ -z "$P" ]; then
+            echo "::error::CCC_TEST_EMAIL_A / CCC_TEST_PASSWORD secrets are required. Refusing to run."
+            exit 1
+          fi
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - run: npm run build
+      - name: Start production server
+        run: npm run start -- -p 3100 &
+      - name: Wait for server
+        run: |
+          for i in $(seq 1 60); do
+            curl -sf http://localhost:3100/login > /dev/null && exit 0
+            sleep 1
+          done
+          echo "::error::server did not start" && exit 1
+      - name: Real browser integration flow
+        env:
+          CCC_TEST_EMAIL_A: ${{ secrets.CCC_TEST_EMAIL_A }}
+          CCC_TEST_PASSWORD: ${{ secrets.CCC_TEST_PASSWORD }}
+        run: node scripts/integration-live.mjs http://localhost:3100 docs/validation/live
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-screens
+          path: docs/validation/live
