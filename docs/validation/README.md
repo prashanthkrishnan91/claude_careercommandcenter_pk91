@@ -1,14 +1,15 @@
 # Validation report
 
-## 1. Automated suites — 137 tests (run in this repo, output in BUILD_REPORT.md)
+## 1. Automated suites — 156 tests (run in this repo, output in BUILD_REPORT.md)
 
-- `tests/schema.test.ts` — fresh 5-migration chain applies from an empty
+- `tests/schema.test.ts` — fresh 6-migration chain applies from an empty
   database (49 tables); exact canonical columns/enums/defaults; substituted
   values (`EVIDENCED`, `SENSITIVE`, `EXTERNAL_OK`, `COMPLETED`) rejected;
   composite same-user FKs on every relationship including all nine junction
   tables + Gate 7's qualifying offer; SECURITY DEFINER confined to an exact
   allowlist, each with a pinned search_path; RLS on all 49 tables (×4
-  policies, ×1 select-only on the five client-read-only tables); grants;
+  policies, ×1 select-only on the seven client-read-only tables — including
+  `asset_versions` and `collection_assets`, which no client may write); grants;
   enforcement triggers (offer acceptance, Gate 7, version chain, external-use
   and collection validation, approval/current guards, reference use,
   has_metric sync, append-only audit).
@@ -43,8 +44,25 @@
   verification and approved-archetype policies with exact-payload checks and a
   TS↔SQL parity matrix; live maturity (regression revokes P1 with no recompute
   call; a forged `maturity_state` grants nothing); all twelve P1 tables
-  enforced with an append-only, reason-snapshotted override audit; and
-  direct-PostgREST bypass rejection for every safety-critical transition.
+  enforced with an append-only, reason-snapshotted override audit;
+  direct-PostgREST bypass rejection for every safety-critical transition;
+  `asset_versions` and `collection_assets` client-read-only (insert, update and
+  delete all match nothing, with the column guards still firing on a privileged
+  path); membership validated on UPDATE and rejecting a version filed under the
+  wrong asset; an emptied approved/current collection demoted; a locked DELETE
+  rejected on every one of the twelve P1 tables; and the maturity/override
+  predicates refusing to report on another user.
+- `tests/integrationContract.test.ts` — executes the SAME dataset module the
+  browser certification runs (`scripts/integration-dataset.mjs`) against the
+  full migration chain, so a nonexistent column, an invalid enum, a missing
+  required field or a violated constraint fails on push instead of waiting for
+  a live run. Covers the vault seed, grader persistence/ceilings/canonical
+  `dimension_disputes`, user-defined + JD-derived archetypes with a retained
+  source and a gap report, metric/evidence eligibility, version-exact
+  collections, the whole P1 relationship chain, benchmark/scenario/counter,
+  skills → strength-scored evidence → plan → dated progress, the Monthly
+  Board, the OAuth race, the maturity regression, the full direct-write bypass
+  matrix, and a structural scan asserting every column the module names exists.
 - `tests/crud.test.ts` — behavior against the real migrations + RLS (PGlite
   hermetic; identical spec runs live with `TEST_LIVE=1`): CRUD/persistence,
   archive/restore, cross-user linking fails at the DB, spoofed user_id

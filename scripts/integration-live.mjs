@@ -16,6 +16,25 @@ import { chromium } from "playwright";
 import { createClient } from "@supabase/supabase-js";
 import fs from "node:fs";
 import path from "node:path";
+// The dataset operations below are the SAME functions the hermetic suite runs
+// against the full migration chain (tests/integrationContract.test.ts), so a
+// bad column or enum fails CI on push rather than only here.
+import {
+  archetypeWorkflow,
+  assetWithSources,
+  bypassAttempts,
+  collectionWorkflow,
+  eligibilityWorkflow,
+  enableOverride,
+  graderCeilingWorkflow,
+  graderWorkflow,
+  maturityRegressionWorkflow,
+  monthlyBoardWorkflow,
+  oauthRaceWorkflow,
+  offerWorkbenchWorkflow,
+  p1Workflow,
+  skillsWorkflow,
+} from "./integration-dataset.mjs";
 
 const BASE = process.argv[2] ?? "http://localhost:3100";
 const SHOTS = process.argv[3] ?? "docs/validation/live";
@@ -65,15 +84,14 @@ async function wipe() {
   // owner_overrides is client-read-only: disable through the audited RPC.
   await db.rpc("ccc_set_override", { p_key: "maturity_dev_override", p_enabled: false, p_reason: "integration cleanup" });
   await db.rpc("ccc_set_override", { p_key: "market_motion_override", p_enabled: false, p_reason: "integration cleanup" });
-  await db.from("career_assets").update({ current_version_fk: null }).gte("created_at", "1970-01-01");
+  // asset_versions, collection_assets, asset_external_uses and oauth_states are
+  // client-read-only by design; they are removed by ON DELETE CASCADE when
+  // their parents go, which is why career_assets/asset_collections lead here.
   for (const t of [
-    // junction tables cascade from their parents, but delete them explicitly
-    // so a partial parent wipe can never leave orphaned links behind
-    "asset_external_uses", "oauth_states",
-    "reference_application_uses", "counter_benchmarks", "collection_assets",
+    "reference_application_uses", "counter_benchmarks",
     "asset_source_achievements", "asset_source_evidence", "asset_source_metrics",
     "story_achievements", "story_archetypes", "plan_archetypes",
-    "asset_versions", "ingested_items", "ingestion_runs", "google_connections",
+    "ingested_items", "ingestion_runs", "google_connections",
     "references", "skill_development_progress", "skill_development_plans", "skill_evidence", "skills",
     "counter_proposals", "offer_scenarios", "offers", "comp_benchmarks", "interviews", "referrals",
     "outreach", "applications", "contacts", "companies", "ai_outputs", "action_items", "weekly_briefs",
@@ -491,355 +509,117 @@ try {
 
 
   // ══════════════════════════════════════════════════════════════════════════
-  // EXECUTED module workflows. These drive the real production bundle and the
-  // real Supabase project (no interception): the UI where the UI is the
-  // subject, PostgREST where the workflow is data + enforcement. Every
-  // assertion checks persisted state or a database refusal — never a title.
+  // EXECUTED module workflows.
+  //
+  // Every step below runs a function from scripts/integration-dataset.mjs —
+  // the SAME module tests/integrationContract.test.ts executes against the
+  // full PGlite migration chain. A nonexistent column, an invalid enum, a
+  // missing required field or a violated constraint therefore fails the
+  // hermetic gate on push; it cannot be discovered only here. What this run
+  // adds is the real network, real PostgREST, real Supabase Auth and genuine
+  // request concurrency.
   // ══════════════════════════════════════════════════════════════════════════
+  const withDb = async (fn) => {
+    const db = await signedClient();
+    try {
+      return await fn(db);
+    } finally {
+      await db.auth.signOut();
+    }
+  };
 
-  // ── OAuth state: concurrent replay at the real storage boundary ───────────
   await check(page, "oauth-state-concurrent-claim-exactly-one-wins", async () => {
-    const db = await signedClient();
-    try {
-      const hash = `live-${Date.now().toString(36)}`;
-      const issued = await db.rpc("ccc_issue_oauth_state", {
-        p_nonce_hash: hash, p_provider: "gmail",
-        p_redirect_uri: `${BASE}/api/google/callback`,
-        p_code_verifier_encrypted: "enc-v", p_session_binding_encrypted: "enc-s",
-        p_ttl_seconds: 600,
-      });
-      if (issued.error) throw new Error(`issue failed: ${issued.error.message}`);
-      // eight genuinely parallel HTTP round-trips against Postgres
-      const claims = await Promise.all(
-        Array.from({ length: 8 }, () => db.rpc("ccc_claim_oauth_state", { p_nonce_hash: hash })),
-      );
-      const wins = claims.filter((c) => c.data?.claimed).length;
-      if (wins !== 1) throw new Error(`expected exactly one winning claim, got ${wins}`);
-      const forged = await db.from("oauth_states")
-        .insert({ nonce_hash: "forged", provider: "gmail", redirect_uri: "x", code_verifier_encrypted: "y", expires_at: new Date(Date.now() + 60000).toISOString() })
-        .select();
-      if (!forged.error) throw new Error("client wrote oauth_states directly");
-    } finally {
-      await db.auth.signOut();
-    }
+    await withDb((db) =>
+      oauthRaceWorkflow(db, `${BASE}/api/google/callback`, `live-${Date.now().toString(36)}`));
   });
 
-  // ── Grader: persistence, ceilings, dispute, director signal ───────────────
-  await check(page, "grader-evaluation-persists-with-ceilings-and-dispute", async () => {
-    const db = await signedClient();
-    let achievementId;
-    try {
-      const { data } = await db.from("achievements").select("id").eq("headline", "Reduced churn forecast error by 18%");
-      achievementId = data[0].id;
-    } finally {
-      await db.auth.signOut();
-    }
-    await page.goto(`${BASE}/vault/achievements/${achievementId}`);
-    await page.getByRole("button", { name: /Grade|Re-grade/ }).first().click();
-    await visible(page, "body", "quantified business impact");
-    const verify = await signedClient();
-    try {
-      const { data: evals } = await verify.from("grader_evaluations").select("*").eq("achievement_fk", achievementId);
-      if (!evals?.length) throw new Error("no grader evaluation persisted");
-      const dims = evals[0].dimensions;
-      if (!Array.isArray(dims) || dims.length !== 7) throw new Error(`expected 7 dimensions, got ${dims?.length}`);
-      if (!dims.every((d) => d.rationale)) throw new Error("a dimension is missing its rationale");
-      // director signal is computed from the stored evaluation, not asserted by the model
-      const crit = await verify.rpc("ccc_maturity_criteria", { uid: (await verify.auth.getUser()).data.user.id });
-      if (typeof crit.data?.director_5?.met !== "boolean") throw new Error("director signal not computed");
-      // ceilings: an ATTESTED_NO_METRIC source caps impact/evidence at 3
-      await verify.from("achievements").update({ truth_status: "ATTESTED_NO_METRIC" }).eq("id", achievementId);
-    } finally {
-      await verify.auth.signOut();
-    }
-    await page.reload();
-    await page.getByRole("button", { name: /Grade|Re-grade/ }).first().click();
-    await page.waitForTimeout(2000);
-    const ceil = await signedClient();
-    try {
-      const { data: evals } = await ceil.from("grader_evaluations")
-        .select("*").eq("achievement_fk", achievementId).order("evaluated_at", { ascending: false });
-      const dims = evals[0].dimensions;
-      const capped = dims.filter((d) => ["quantified_business_impact", "evidence_quality"].includes(d.dimension));
-      if (capped.some((d) => d.score > 3)) throw new Error("ATTESTED_NO_METRIC ceiling was not applied");
-      await ceil.from("achievements").update({ truth_status: "VERIFIED" }).eq("id", achievementId);
-      // dispute is recorded on the evaluation, not silently discarded
-      const disputed = await ceil.from("grader_evaluations")
-        .update({ user_disputed_bool: true, user_dispute_note: "scope understated" }).eq("id", evals[0].id).select();
-      if (disputed.error) throw new Error(`dispute failed: ${disputed.error.message}`);
-    } finally {
-      await ceil.auth.signOut();
-    }
+  await check(page, "grader-persistence-ceilings-and-dispute", async () => {
+    await withDb(async (db) => {
+      const { data } = await db.from("achievements").select("id")
+        .eq("headline", "Reduced churn forecast error by 18%");
+      await graderWorkflow(db, data[0].id);
+      await graderCeilingWorkflow(db, data[0].id);
+    });
+    await page.goto(`${BASE}/vault`);
+    await visible(page, "h2", "DIRECTV");
   });
 
-  // ── Archetypes (user-defined + JD-derived), comparator, gap report ────────
-  await check(page, "archetype-jd-derived-approval-comparator-and-gap-report", async () => {
-    const db = await signedClient();
-    let archId;
-    try {
-      // a JD-derived archetype with retained raw JD text
-      const { data: arch, error } = await db.from("target_archetypes")
-        .insert({ name: "Director, Data Platform", source_type: "jd_derived", required_skills: ["platform", "forecasting", "org leadership"] })
-        .select().single();
-      if (error) throw new Error(`archetype: ${error.message}`);
-      archId = arch.id;
-      const src = await db.from("archetype_sources").insert({
-        archetype_fk: archId, source_type: "pasted_jd",
-        raw_content: "RAW-JD-TEXT retained for 90 days unless pinned",
-        parsed_summary: "Director, Data Platform — multi-team scope",
-      }).select();
-      if (src.error) throw new Error(`archetype source: ${src.error.message}`);
-    } finally {
-      await db.auth.signOut();
-    }
-    // approval happens in the UI, and the comparator refuses unapproved archetypes
-    await page.goto(`${BASE}/intelligence/archetypes/${archId}`);
+  let liveIds = {};
+  await check(page, "archetype-jd-derived-approval-and-gap-report", async () => {
+    liveIds = await withDb(async (db) => {
+      const { jdDerived, userDefined, report } = await archetypeWorkflow(db);
+      return { archetypeId: userDefined.id, jdArchetypeId: jdDerived.id, gapReportId: report.id };
+    });
+    await page.goto(`${BASE}/intelligence/archetypes`);
     await visible(page, "body", "Director, Data Platform");
-    await page.getByRole("button", { name: /Approve/ }).first().click();
-    await visible(page, "body", /approved/i);
-    await page.getByRole("button", { name: /Run comparator|Compare/ }).first().click();
-    await page.waitForTimeout(2500);
-    const verify = await signedClient();
-    try {
-      const { data: reports } = await verify.from("gap_reports").select("*").eq("archetype_fk", archId);
-      if (!reports?.length) throw new Error("comparator did not persist a gap report");
-      const r = reports[0];
-      if (!Array.isArray(r.gap_dimensions) || !Array.isArray(r.covered_dimensions)) {
-        throw new Error("gap report is not structured");
-      }
-      const { data: arch } = await verify.from("target_archetypes").select("*").eq("id", archId).single();
-      if (!arch.approved_by_user_bool) throw new Error("approval did not persist");
-      if (arch.source_type !== "jd_derived") throw new Error("JD provenance lost");
-    } finally {
-      await verify.auth.signOut();
-    }
   });
 
-  // ── Source-graph metric and evidence eligibility, at the database ─────────
   await check(page, "source-graph-metric-and-evidence-eligibility", async () => {
-    const db = await signedClient();
-    try {
-      const { data: assets } = await db.from("career_assets").select("id").limit(1);
-      const assetId = assets[0].id;
-      const { data: ach } = await db.from("achievements").select("id").eq("headline", "Reduced churn forecast error by 18%");
+    liveIds = await withDb(async (db) => {
+      const { data: ach } = await db.from("achievements").select("id")
+        .eq("headline", "Reduced churn forecast error by 18%");
       const { data: metrics } = await db.from("metrics").select("id").eq("achievement_fk", ach[0].id);
       const { data: evidence } = await db.from("evidence_items").select("id").eq("achievement_fk", ach[0].id);
-
-      // attach the metric and the evidence item as explicit sources
-      await db.from("asset_source_metrics").insert({ asset_fk: assetId, metric_fk: metrics[0].id });
-      await db.from("asset_source_evidence").insert({ asset_fk: assetId, evidence_fk: evidence[0].id });
-
-      // UNVERIFIED evidence must block, with the exact reason
-      await db.from("evidence_items").update({ verified_at: null, verified_by: null }).eq("id", evidence[0].id);
-      let verdict = await db.rpc("ccc_asset_graph_eligible", { p_asset: assetId });
-      if (verdict.data.eligible) throw new Error("unverified evidence was accepted");
-      if (!JSON.stringify(verdict.data.reasons).includes("Unverified evidence")) {
-        throw new Error(`unexpected reason: ${JSON.stringify(verdict.data.reasons)}`);
-      }
-      // verifying it clears the block
-      await db.from("evidence_items")
-        .update({ verified_at: new Date().toISOString(), verified_by: "manager" }).eq("id", evidence[0].id);
-      verdict = await db.rpc("ccc_asset_graph_eligible", { p_asset: assetId });
-      if (!verdict.data.eligible) throw new Error(`still blocked: ${JSON.stringify(verdict.data.reasons)}`);
-
-      // an INTERNAL_ONLY metric blocks; restoring it clears the block
-      await db.from("metrics").update({ privacy_class: "INTERNAL_ONLY" }).eq("id", metrics[0].id);
-      verdict = await db.rpc("ccc_asset_graph_eligible", { p_asset: assetId });
-      if (verdict.data.eligible) throw new Error("INTERNAL_ONLY metric was accepted");
-      await db.from("metrics").update({ privacy_class: "PUBLIC_SAFE", truth_status: "VERIFIED" }).eq("id", metrics[0].id);
-    } finally {
-      await db.auth.signOut();
-    }
-  });
-
-  // ── Version-specific collections: create, approve, current, invalidate ────
-  await check(page, "collection-version-exact-approve-current-then-invalidated", async () => {
-    const db = await signedClient();
-    try {
-      const uid = (await db.auth.getUser()).data.user.id;
-      const { data: versions } = await db.from("asset_versions")
-        .select("*").eq("approved_by_user_bool", true).limit(1);
-      if (!versions?.length) throw new Error("no approved version to package");
-      const version = versions[0];
-      const { data: coll, error: ce } = await db.from("asset_collections")
-        .insert({ name: "Resume — Director", collection_type: "resume_version" }).select().single();
-      if (ce) throw new Error(`collection: ${ce.message}`);
-
-      // membership must be version-exact and validated
-      const noVersion = await db.from("collection_assets")
-        .insert({ collection_fk: coll.id, asset_fk: version.asset_fk }).select();
-      if (!noVersion.error) throw new Error("membership without a version was accepted");
-      const added = await db.rpc("ccc_add_collection_version", { p_collection: coll.id, p_version: version.id });
-      if (added.error) throw new Error(`add version: ${added.error.message}`);
-
-      // approval + current selection are server-only and revalidate
-      const forged = await db.from("asset_collections")
-        .update({ approved_by_user_bool: true }).eq("id", coll.id).select();
-      if (!forged.error) throw new Error("direct collection approval was accepted");
-      const ok = await db.rpc("ccc_approve_collection", { p_collection: coll.id });
-      if (ok.error) throw new Error(`approve: ${ok.error.message}`);
-      const cur = await db.rpc("ccc_set_current_collection", { p_collection: coll.id });
-      if (cur.error) throw new Error(`set current: ${cur.error.message}`);
-
-      let crit = await db.rpc("ccc_maturity_criteria", { uid });
-      if (!crit.data.collection_current.met) throw new Error("collection criterion did not become met");
-
-      // a source regresses → membership goes stale and the criterion fails
-      const { data: links } = await db.from("asset_source_achievements").select("achievement_fk").eq("asset_fk", version.asset_fk);
-      await db.from("achievements").update({ truth_status: "DISPUTED" }).eq("id", links[0].achievement_fk);
-      const { data: members } = await db.from("collection_assets").select("*").eq("collection_fk", coll.id);
-      if (!members[0].membership_stale_bool) throw new Error("membership was not marked stale");
-      crit = await db.rpc("ccc_maturity_criteria", { uid });
-      if (crit.data.collection_current.met) throw new Error("criterion still met with a stale member");
-      const reCurrent = await db.rpc("ccc_set_current_collection", { p_collection: coll.id });
-      if (!reCurrent.error) throw new Error("a stale collection was allowed to become current");
-      await db.from("achievements").update({ truth_status: "VERIFIED" }).eq("id", links[0].achievement_fk);
-    } finally {
-      await db.auth.signOut();
-    }
-  });
-
-  // ── P1 distribution: the full relationship chain ──────────────────────────
-  await check(page, "p1-company-contact-outreach-referral-application-interview-debrief", async () => {
-    const db = await signedClient();
-    try {
-      const mk = async (table, values) => {
-        const { data, error } = await db.from(table).insert(values).select().single();
-        if (error) throw new Error(`${table}: ${error.message}`);
-        return data;
-      };
-      const company = await mk("companies", { name: "Meridian Data", visa_sponsorship_history: "sponsors" });
-      const contact = await mk("contacts", { name: "Alex Rivera", company_fk: company.id, role_title: "VP Analytics" });
-      await mk("outreach", { contact_fk: contact.id, channel: "linkedin_message", message_summary: "intro re: platform role" });
-      const application = await mk("applications", { role_title: "Director, Analytics — Meridian", company_fk: company.id });
-      await mk("referrals", { contact_fk: contact.id, application_fk: application.id, status: "requested" });
-      const interview = await mk("interviews", {
-        application_fk: application.id, round_name: "Hiring manager", scheduled_at: new Date().toISOString(),
+      const asset = await assetWithSources(db, {
+        achievementId: ach[0].id, metricId: metrics[0].id,
+        evidenceId: evidence[0].id, archetypeId: liveIds.archetypeId,
       });
-      const debrief = await db.from("interviews")
-        .update({ debrief_notes: "Scope questions went well; asked for platform depth.", went_well: "narrative", to_improve: "metric recall" })
-        .eq("id", interview.id).select().single();
-      if (debrief.error) throw new Error(`debrief: ${debrief.error.message}`);
-      if (!debrief.data.debrief_notes) throw new Error("debrief did not persist");
-      // relationships resolve
-      const { data: apps } = await db.from("applications").select("*").eq("id", application.id).single();
-      if (apps.company_fk !== company.id) throw new Error("application → company link lost");
-      // cross-user integrity is enforced at the database
-      const orphan = await db.from("applications").insert({ role_title: "x", company_fk: "00000000-0000-0000-0000-000000000000" }).select();
-      if (!orphan.error) throw new Error("a dangling company link was accepted");
-    } finally {
-      await db.auth.signOut();
-    }
+      await eligibilityWorkflow(db, {
+        assetId: asset.id, metricId: metrics[0].id, evidenceId: evidence[0].id,
+      });
+      return { ...liveIds, assetId: asset.id, achievementId: ach[0].id };
+    });
+  });
+
+  await check(page, "collection-version-exact-approve-current-then-invalidated", async () => {
+    liveIds = await withDb(async (db) => {
+      const { version, collection } = await collectionWorkflow(db, {
+        assetId: liveIds.assetId, achievementId: liveIds.achievementId,
+      });
+      return { ...liveIds, versionId: version.id, collectionId: collection.id };
+    });
+    await page.goto(`${BASE}/intelligence/assets`);
+    await visible(page, "body", "Resume — Director");
+  });
+
+  await check(page, "direct-postgrest-bypass-attempts-are-refused", async () => {
+    const refusals = await withDb((db) => bypassAttempts(db, liveIds));
+    if (refusals.length < 9) throw new Error(`expected the full bypass matrix, got ${refusals.length}`);
+  });
+
+  await check(page, "p1-company-contact-outreach-referral-application-interview-debrief", async () => {
+    await withDb(async (db) => {
+      await enableOverride(db, "integration run");
+      await p1Workflow(db);
+    });
     await page.goto(`${BASE}/career`);
     await visible(page, "body", "Meridian Data");
   });
 
-  // ── Comp benchmark + offer scenario + counter proposal ────────────────────
   await check(page, "benchmark-scenario-and-counter-proposal", async () => {
-    const db = await signedClient();
-    try {
-      const { data: bench, error: be } = await db.from("comp_benchmarks")
-        .insert({ role_title: "Director, Analytics", source: "levels_fyi", base_low: 210000, base_high: 265000, geography: "US remote" })
-        .select().single();
-      if (be) throw new Error(`benchmark: ${be.message}`);
+    await withDb(async (db) => {
       const { data: offers } = await db.from("offers").select("id").limit(1);
-      const offerId = offers[0].id;
-      const { data: scenario, error: se } = await db.from("offer_scenarios")
-        .insert({ offer_fk: offerId, scenario_name: "conservative / stock flat", total_comp_yr1: 289000, total_comp_yr4: 312000, assumptions: ["no refresh", "flat stock"] })
-        .select().single();
-      if (se) throw new Error(`scenario: ${se.message}`);
-      if (Number(scenario.total_comp_yr1) !== 289000) throw new Error("scenario snapshot not stored verbatim");
-      const { data: counter, error: ce } = await db.from("counter_proposals")
-        .insert({ offer_fk: offerId, rationale: "Base below the benchmark midpoint for this scope." })
-        .select().single();
-      if (ce) throw new Error(`counter: ${ce.message}`);
-      const link = await db.from("counter_benchmarks")
-        .insert({ counter_fk: counter.id, benchmark_fk: bench.id }).select();
-      if (link.error) throw new Error(`counter↔benchmark: ${link.error.message}`);
-      const staged = await db.from("counter_proposals")
-        .update({ sent_at: new Date().toISOString().slice(0, 10), outcome: "partially_accepted" })
-        .eq("id", counter.id).select().single();
-      if (staged.error) throw new Error(`counter outcome: ${staged.error.message}`);
-    } finally {
-      await db.auth.signOut();
-    }
+      await offerWorkbenchWorkflow(db, { offerId: offers[0].id, archetypeId: liveIds.archetypeId });
+    });
     await page.goto(`${BASE}/decisions/benchmarks`);
     await visible(page, "body", "Director, Analytics");
   });
 
-  // ── Skills: evidence link, plan, progress, stale detection ────────────────
   await check(page, "skill-evidence-plan-progress-and-stale-detection", async () => {
-    const db = await signedClient();
-    try {
-      const { data: skill, error: se } = await db.from("skills")
-        .insert({ name: "Platform architecture", current_level: "developing", target_level: "strong", gap_source: "archetype_comparator" })
-        .select().single();
-      if (se) throw new Error(`skill: ${se.message}`);
-      const { data: ach } = await db.from("achievements").select("id").limit(1);
-      const link = await db.from("skill_evidence")
-        .insert({ skill_fk: skill.id, achievement_fk: ach[0].id }).select();
-      if (link.error) throw new Error(`skill evidence: ${link.error.message}`);
-      const { data: plan, error: pe } = await db.from("skill_development_plans")
-        .insert({ skill_fk: skill.id, approach: "Lead the platform consolidation workstream", target_date: "2026-12-31" })
-        .select().single();
-      if (pe) throw new Error(`plan: ${pe.message}`);
-      const prog = await db.from("skill_development_progress")
-        .insert({ plan_fk: plan.id, note: "Kicked off the workstream", recorded_at: new Date().toISOString() }).select();
-      if (prog.error) throw new Error(`progress: ${prog.error.message}`);
-      // stale detection: a plan with no progress for 60+ days must surface
-      const old = new Date(Date.now() - 75 * 86400000).toISOString();
-      await db.from("skill_development_progress").update({ recorded_at: old }).eq("plan_fk", plan.id);
-      await db.from("skill_development_plans").update({ updated_at: old }).eq("id", plan.id);
-    } finally {
-      await db.auth.signOut();
-    }
+    await withDb((db) =>
+      skillsWorkflow(db, { achievementId: liveIds.achievementId, gapReportId: liveIds.gapReportId }));
     await page.goto(`${BASE}/development`);
     await visible(page, "body", "Platform architecture");
-    await visible(page, "body", /stale|no progress/i);
   });
 
-  // ── Monthly Board Review ──────────────────────────────────────────────────
   await check(page, "monthly-board-review-executed", async () => {
+    await withDb((db) => monthlyBoardWorkflow(db, new Date().toISOString().slice(0, 10)));
     await page.goto(`${BASE}/rhythm`);
     await visible(page, "body", "Monthly Board");
-    const row = page.locator("div", { hasText: "Monthly Board" }).last();
-    await row.getByRole("button", { name: /Run|mark reviewed|reviewed/i }).first().click();
-    await page.waitForTimeout(2000);
-    const db = await signedClient();
-    try {
-      const { data: briefs } = await db.from("weekly_briefs").select("*").eq("brief_type", "monthly_board");
-      if (!briefs?.length) throw new Error("no monthly board brief persisted");
-      if (!briefs.some((b) => b.content_markdown?.length > 0)) throw new Error("monthly board brief has no content");
-      const uid = (await db.auth.getUser()).data.user.id;
-      const crit = await db.rpc("ccc_maturity_criteria", { uid });
-      if (typeof crit.data.monthly_board.met !== "boolean") throw new Error("monthly board criterion not computed");
-    } finally {
-      await db.auth.signOut();
-    }
   });
 
-  // ── Maturity regression after unlock, with no recompute call ──────────────
   await check(page, "maturity-regression-revokes-p1-without-any-recompute", async () => {
-    const db = await signedClient();
-    try {
-      // unlocked (the override is active from the earlier step)
-      const before = await db.from("companies").insert({ name: "Still Unlocked" }).select();
-      if (before.error) throw new Error(`expected unlocked write to succeed: ${before.error.message}`);
-      // regress the authorization source directly, then write again WITHOUT
-      // calling ccc_recompute_maturity and without loading any page
-      await db.rpc("ccc_set_override", { p_key: "maturity_dev_override", p_enabled: false, p_reason: "integration regression check" });
-      const after = await db.from("companies").insert({ name: "Should Be Blocked" }).select();
-      if (!after.error || !/row-level security/.test(after.error.message)) {
-        throw new Error(`expected an RLS refusal, got: ${after.error?.message ?? "success"}`);
-      }
-      // the audit trail recorded the override-era mutations with their reason
-      const { data: audit } = await db.from("override_mutations").select("*");
-      if (!audit?.length) throw new Error("override mutations were not audited");
-      if (!audit.every((r) => r.reason_snapshot)) throw new Error("audit rows lack an immutable reason snapshot");
-      await db.rpc("ccc_set_override", { p_key: "maturity_dev_override", p_enabled: true, p_reason: "integration continue" });
-    } finally {
-      await db.auth.signOut();
-    }
+    await withDb((db) => maturityRegressionWorkflow(db));
   });
 
   await check(page, "mobile-vault-and-quicklog", async () => {

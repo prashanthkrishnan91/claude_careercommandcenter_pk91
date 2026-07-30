@@ -64,6 +64,22 @@ snapshot. Migration `20260730030000_authoritative_boundaries.sql` closes that:
 | 8 | Safety-critical writes went through generic `updateRow` | Approval, collection approve/current/membership and external use are RPC-only, with guard triggers rejecting the generic update. Direct-PostgREST bypass tests prove each refusal. |
 | 9 | Integration script probed route titles | 39 checks that execute the workflows — grader persistence/ceilings/dispute, JD archetype + comparator + persisted gap report, metric/evidence eligibility, version-exact collections through approval → current → invalidation, the full P1 relationship chain, benchmark + scenario + counter, skills → evidence → plan → progress → stale, Monthly Board, maturity regression, and a concurrent OAuth-claim race at the real storage boundary. |
 
+## Write-bypass closure pass (third semantic review)
+
+The prior pass guarded specific COLUMNS but left whole OPERATIONS open.
+`20260730040000_close_write_bypasses.sql` closes them:
+
+| # | Finding | Correction |
+|---|---|---|
+| 1 | A client could INSERT an asset version outright (forging model/prompt metadata, skipping the audit), DELETE one, or break the chain | `asset_versions` is client-read-only: all DML revoked, write policies dropped. Creation goes through `ccc_commit_asset_version`; hand-authoring through `ccc_author_manual_version`, which records the version as hand-authored and does not accept model metadata from the caller. |
+| 2 | `career_assets` derived fields were guarded one at a time | One guard covers `current_version_fk`, `truth_status_summary`, `privacy_class`, `used_externally_bool` and `eligibility_*`. Staleness is refreshed only by `ccc_refresh_asset_eligibility` / the propagation trigger — `lib/assetService.ts` no longer writes those columns at all. |
+| 3 | `collection_assets` accepted direct UPDATE and DELETE | Client-read-only; add/remove through `ccc_add_collection_version` / `ccc_remove_collection_version`. Validation runs on INSERT **and UPDATE** (version resolves, belongs to the stated asset, same user for asset+version+collection, approved, unblocked, graph eligible, not stale). Revalidation explicitly reports `version.asset_fk <> membership.asset_fk`. Any membership change atomically re-checks the collection and DEMOTES an approved/current one that would be left invalid or empty. |
+| 4 | P1 DELETE was ungated | All twelve P1 tables gate DELETE on `ccc_p1_unlocked()` alongside INSERT and UPDATE; a locked-delete rejection test covers every table, and override-era deletes are audited. |
+| 5 | Maturity/override predicates accepted an arbitrary user id | The public predicates take **no parameter** and derive the subject from `auth.uid()`; `ccc_maturity_criteria(uid)` rejects any id that is not the caller's. The parameterised implementations exist for triggers and are not granted to `authenticated`. |
+| 6 | The integration script named columns and enums that do not exist | Every operation corrected against the canonical schema (`gc_sponsorship_history`, `channel = linkedin`, `summary`, `stage = requested`, `round`/`debrief_markdown`/`themes`/`outcome`, `total_comp_low/high`/`as_of`, `dimension_disputes`, canonical skill fields, `demonstration_strength_1_to_5`, plan gap/level/method fields, `progress_date`/`notes`/linked-achievement/assessment fields). |
+| 7 | A schema mismatch could only be discovered during a live run | The dataset lives in `scripts/integration-dataset.mjs` and is executed TWICE: by the browser certification and by `tests/integrationContract.test.ts` against the full PGlite chain. The hermetic gate now fails on a bad column, invalid enum, missing required field or violated constraint — plus a structural scan that checks every column the module names against `information_schema`. |
+| 8 | *(found by the new gate)* Fifteen composite `ON DELETE SET NULL` constraints nulled `user_id` too, so deleting any parent raised a not-null violation | Each restricted to its own foreign-key column. |
+
 ## Stack
 
 Next.js 15 (App Router, TS, Tailwind; client data layer over
@@ -76,7 +92,7 @@ vendored from npm.
 
 ## Schema
 
-Five-migration chain, applied identically to the remote project and loaded
+Six-migration chain, applied identically to the remote project and loaded
 verbatim by the hermetic suite (drift breaks tests):
 
 1. `20260730000100_p0a_canonical_schema.sql` — the four canonical entities.
@@ -111,6 +127,14 @@ verbatim by the hermetic suite (drift breaks tests):
    external-use RPCs with their guard triggers, live maturity
    (`ccc_maturity_criteria` inside `ccc_p1_unlocked`), full P1 coverage and the
    durable override audit.
+6. `20260730040000_close_write_bypasses.sql` — `asset_versions` and
+   `collection_assets` become client-read-only (all DML revoked, policies
+   dropped, every mutation through a validating RPC); `career_assets` derived
+   fields guarded as a set; membership validated on UPDATE as well as INSERT
+   with an atomic demote of an approved/current collection that would be left
+   invalid or empty; P1 DELETE gated on maturity; the maturity/override
+   predicates made parameterless; and the 15 remaining composite
+   `ON DELETE SET NULL` constraints scoped to their own column.
 
 49 public tables. Every table: `user_id` default `auth.uid()`, RLS scoped to
 the user, and **composite same-user foreign keys** — a child row's
@@ -162,6 +186,7 @@ authorization predicate; each pins `search_path` and is scoped to
 | 6 | Apply `full_product_schema` | success (36 public tables) |
 | 7 | Apply `integrity_and_enforcement` (junctions, triggers, maturity) | success (47 public tables) |
 | 8 | Apply `enforcement_corrections` (fixes found by the hermetic chain) | success |
+| 10 | Apply `close_write_bypasses` in three parts (read-only version/membership tables + RPCs, P1 DELETE gating + parameterless predicates, composite SET NULL corrections) | success (49 tables; 0 leftover DML grants, 12 gated DELETE policies, 0 unscoped composite SET NULL) |
 | 9 | Apply `authoritative_boundaries` in six parts (OAuth ledger, SQL graph gate, transactional commits + external-use records, version-exact collections, live maturity, P1 coverage + grants) | success (49 public tables; verified to match the hermetic chain) |
 
 Travel and Finance Supabase projects were not touched at any point.
@@ -172,7 +197,7 @@ project existed; drop SQL is in the PR discussion. Pre-existing advisory:
 
 ## Verification evidence
 
-### Automated suites — 137 passing
+### Automated suites — 156 passing
 
 ```
 behavior suite backend: pglite (hermetic, real migrations + RLS)
@@ -183,10 +208,11 @@ behavior suite backend: pglite (hermetic, real migrations + RLS)
  ✓ tests/schema.test.ts                 (16 tests)
  ✓ tests/assetSafety.test.ts            (14 tests)
  ✓ tests/crud.test.ts                   (30 tests)
- ✓ tests/authoritativeBoundaries.test.ts (32 tests)
+ ✓ tests/authoritativeBoundaries.test.ts (37 tests)
+ ✓ tests/integrationContract.test.ts     (14 tests)
 
- Test Files  7 passed (7)
-      Tests  137 passed (137)
+ Test Files  8 passed (8)
+      Tests  156 passed (156)
 ```
 
 Coverage map against the test contract: full migration chain from an empty

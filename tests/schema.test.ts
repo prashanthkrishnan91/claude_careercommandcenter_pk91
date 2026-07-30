@@ -175,12 +175,21 @@ describe("security objects", () => {
       "ccc_add_collection_version",
       "ccc_propagate_source_change",
       "ccc_maturity_criteria",
+      "ccc_maturity_criteria_for",
       "ccc_maturity_met",
+      "ccc_maturity_met_for",
+      "ccc_override_active_for",
+      "ccc_p1_unlocked_for",
+      // write-bypass closure
+      "ccc_author_manual_version",
+      "ccc_remove_collection_version",
+      "ccc_refresh_asset_eligibility",
+      "ccc_demote_invalid_collection",
     ];
     const rows = await sql(
       `select proname, prosecdef, proconfig from pg_proc where proname like 'ccc_%'`,
     );
-    expect(rows.length).toBeGreaterThanOrEqual(28);
+    expect(rows.length).toBeGreaterThanOrEqual(35);
     for (const r of rows) {
       if (JUSTIFIED.includes(String(r.proname))) {
         expect(r.prosecdef, `${r.proname} definer`).toBe(true);
@@ -198,6 +207,8 @@ describe("security objects", () => {
     const READ_ONLY = [
       "maturity_state", "override_mutations", "owner_overrides",
       "oauth_states", "asset_external_uses",
+      // written only by the transactional/validated RPCs
+      "asset_versions", "collection_assets",
     ];
     const tables = await sql(
       `select c.relname, c.relrowsecurity,
@@ -241,6 +252,7 @@ describe("security objects", () => {
       "ccc_collection_member_validate",
       "ccc_override_audit_immutable",
       "ccc_ach_source_change",
+      "ccc_collection_member_demote",
     ]) {
       expect(names).toContain(t);
     }

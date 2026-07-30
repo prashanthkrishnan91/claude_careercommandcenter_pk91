@@ -1,6 +1,6 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import type { AssetVersion, CareerAsset } from "./entities";
-import { createRow, updateRow } from "./genericRepo";
+import { createRow } from "./genericRepo";
 import { classifications, gateGraph, resolveSourceGraph, type GraphGate, type SourceGraph } from "./sourceGraph";
 
 // Asset lifecycle. Every SAFETY-CRITICAL transition — version commit,
@@ -47,11 +47,13 @@ export async function audit(
   });
 }
 
-async function markStale(db: SupabaseClient, assetId: string, gate: GraphGate): Promise<void> {
-  await updateRow(db, "career_assets", assetId, {
-    eligibility_stale_bool: !gate.allowed,
-    eligibility_reason: gate.allowed ? "" : gate.reasons.map((r) => `${r.label}: ${r.reason}`).join(" | "),
-  });
+/**
+ * Staleness lives on `career_assets` but is DERIVED — the guard trigger rejects
+ * a client that writes it. Ask the database to recompute and persist it.
+ */
+async function refreshEligibility(db: SupabaseClient, assetId: string): Promise<void> {
+  const { error } = await db.rpc("ccc_refresh_asset_eligibility", { p_asset: assetId });
+  if (error) throw new Error(error.message);
 }
 
 /**
@@ -66,7 +68,7 @@ export async function revalidateAsset(
 ): Promise<{ graph: SourceGraph; gate: GraphGate }> {
   const graph = await resolveSourceGraph(db, assetId);
   const gate = gateGraph(graph, { attestedNoMetricOverride: opts.attestedNoMetricOverride ?? false });
-  await markStale(db, assetId, gate);
+  await refreshEligibility(db, assetId);
   return { graph, gate };
 }
 
@@ -97,9 +99,18 @@ export async function commitVersion(
 export async function authorManualVersion(db: SupabaseClient, assetId: string, content: string): Promise<AssetVersion> {
   const { graph, gate } = await revalidateAsset(db, assetId);
   const truthSummary = [...new Set(graph.sources.map((s) => s.truth_status).filter(Boolean))].join(",");
-  const version = await commitVersion(db, graph.asset, { content }, gate.allowed ? "PUBLIC_SAFE" : null, truthSummary);
+  // A dedicated RPC: it commits transactionally like generation, and records
+  // the version as hand-authored — model and prompt metadata are not
+  // caller-supplied and cannot be forged.
+  const { data, error } = await db.rpc("ccc_author_manual_version", {
+    p_asset: assetId,
+    p_content: content,
+    p_privacy: gate.allowed ? "PUBLIC_SAFE" : null,
+    p_truth_summary: truthSummary,
+  });
+  if (error) throw new Error(error.message);
   await audit(db, graph, `asset_${graph.asset.asset_type}_manual`, { blocked: false, output: content });
-  return version;
+  return data as AssetVersion;
 }
 
 function gateErrorFrom(message: string, verdict?: DbVerdict): never {

@@ -11,6 +11,7 @@ const MIGRATIONS = [
   path.resolve(__dirname, "../../supabase/migrations/20260730010000_integrity_and_enforcement.sql"),
   path.resolve(__dirname, "../../supabase/migrations/20260730020000_enforcement_corrections.sql"),
   path.resolve(__dirname, "../../supabase/migrations/20260730030000_authoritative_boundaries.sql"),
+  path.resolve(__dirname, "../../supabase/migrations/20260730040000_close_write_bypasses.sql"),
 ];
 
 // Minimal PostgREST-style query builder over PGlite, covering exactly the
@@ -29,7 +30,8 @@ class PgliteQuery implements PromiseLike<SbResult> {
   private orderBy: { col: string; ascending: boolean } | null = null;
   private limitCount: number | null = null;
   private returnRows = false;
-  private single = false;
+  private singleRow = false;
+  private requireOne = false;
 
   constructor(
     private readonly pg: PGlite,
@@ -89,7 +91,14 @@ class PgliteQuery implements PromiseLike<SbResult> {
   }
 
   maybeSingle(): this {
-    this.single = true;
+    this.singleRow = true;
+    return this;
+  }
+
+  /** supabase-js `single()`: exactly one row, error otherwise. */
+  single(): this {
+    this.singleRow = true;
+    this.requireOne = true;
     return this;
   }
 
@@ -158,9 +167,12 @@ class PgliteQuery implements PromiseLike<SbResult> {
         return res.rows;
       });
       const data = rows.map((r) => r.row);
-      if (this.single) {
+      if (this.singleRow) {
         if (data.length > 1) {
           return { data: null, error: { message: "more than one row returned" } };
+        }
+        if (this.requireOne && data.length === 0) {
+          return { data: null, error: { message: "no rows returned" } };
         }
         return { data: data[0] ?? null, error: null };
       }
@@ -175,6 +187,10 @@ class PgliteQuery implements PromiseLike<SbResult> {
 function makeClient(pg: PGlite, userId: string): SupabaseClient {
   const client = {
     from: (table: string) => new PgliteQuery(pg, table, userId),
+    // The slice of the auth surface the shared dataset module uses.
+    auth: {
+      getUser: async () => ({ data: { user: { id: userId } }, error: null }),
+    },
     // PostgREST-style RPC under the caller's RLS identity.
     rpc: async (fn: string, args: Record<string, unknown> = {}) => {
       if (!/^[a-z_][a-z0-9_]*$/.test(fn)) return { data: null, error: { message: "bad fn" } };
@@ -241,6 +257,8 @@ export async function createPgliteBackend(): Promise<TestBackend> {
     },
     async cleanup() {
       await pg.exec(`
+        alter table public.collection_assets disable trigger ccc_collection_member_demote;
+        alter table public.career_assets disable trigger ccc_assets_guard;
         alter table public.override_mutations disable trigger ccc_override_audit_immutable;
         alter table public.owner_overrides disable trigger ccc_owner_overrides_immutable;
         delete from public.override_mutations; delete from public.maturity_state;
@@ -269,6 +287,8 @@ export async function createPgliteBackend(): Promise<TestBackend> {
         delete from public.grader_evaluations; delete from public.sanitized_claims;
         delete from public.evidence_items; delete from public.metrics;
         delete from public.achievements; delete from public.projects;
+        alter table public.collection_assets enable trigger ccc_collection_member_demote;
+        alter table public.career_assets enable trigger ccc_assets_guard;
         alter table public.override_mutations enable trigger ccc_override_audit_immutable;
         alter table public.owner_overrides enable trigger ccc_owner_overrides_immutable;
       `);

@@ -306,11 +306,16 @@ describe("blocker #4 — version-chain and junction integrity at the database", 
     const v1 = (await generateAssetVersion(A, asset.id, { transport })).version!;
     const v2 = (await generateAssetVersion(A, asset.id, { transport })).version!;
     const otherAsset = await createRow<CareerAsset>(A, "career_assets", { asset_type: "story" });
-    const foreign = await createRow<AssetVersion>(A, "asset_versions", { asset_fk: otherAsset.id, version_number: 1, content: "x" });
+    // asset_versions is client-read-only: the foreign version has to be made
+    // through the transactional commit path like any other.
+    const foreign = (await A.rpc("ccc_commit_asset_version", {
+      p_asset: otherAsset.id, p_content: "x", p_model: "", p_prompt_hash: "",
+      p_blocked: false, p_block_reason: "", p_privacy: null, p_truth_summary: "", p_ack: false,
+    })).data as AssetVersion;
 
-    // Layer 1: a client cannot touch supersession at all.
+    // Layer 1: a client statement against asset_versions matches nothing.
     const cross = await A.from("asset_versions").update({ superseded_by_fk: foreign.id }).eq("id", v1.id).select();
-    expect(cross.error?.message).toMatch(/only by the server/);
+    expect(cross.data).toEqual([]);
 
     // Layer 2: even on the trusted path, cross-asset and backward (cycle)
     // supersession are rejected by the integrity trigger.

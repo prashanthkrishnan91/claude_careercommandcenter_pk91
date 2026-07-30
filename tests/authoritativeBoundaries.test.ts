@@ -9,6 +9,7 @@ import {
   logExternalUse,
   setCurrentCollection,
 } from "../lib/assetService";
+import { authorManualVersion } from "../lib/assetService";
 import { generateAssetVersion } from "../lib/server/assetGeneration";
 import { gateGraph, resolveSourceGraph } from "../lib/sourceGraph";
 import { createRow, getRow, listRows, updateRow } from "../lib/genericRepo";
@@ -416,8 +417,12 @@ describe("6. maturity is live, not a cached snapshot", () => {
   it("ccc_p1_unlocked recomputes rather than reading maturity_state", async () => {
     const rows = await rawSql(`select prosrc from pg_proc where proname = 'ccc_p1_unlocked'`);
     const src = String(rows[0].prosrc);
-    expect(src).toMatch(/ccc_maturity_met/);
+    // it delegates to the live criteria computation, never to the cache
+    expect(src).toMatch(/ccc_p1_unlocked_for/);
     expect(src).not.toMatch(/maturity_state/);
+    const impl = await rawSql(`select prosrc from pg_proc where proname = 'ccc_p1_unlocked_for'`);
+    expect(String(impl[0].prosrc)).toMatch(/ccc_maturity_met_for/);
+    expect(String(impl[0].prosrc)).not.toMatch(/maturity_state/);
     // and a stale cache cannot grant access
     await rawSql(
       `insert into maturity_state (user_id, unlocked_bool, criteria)
@@ -538,26 +543,39 @@ describe("7. complete P1 and override coverage", () => {
 });
 
 describe("8. safety-critical transitions reject direct PostgREST bypass", () => {
-  it("a fabricated version approval is rejected by the database", async () => {
+  it("asset_versions is client-read-only: insert, update and delete all match nothing", async () => {
     const { asset } = await seedAsset(A);
     const v = (await generateAssetVersion(A, asset.id, { transport: stub })).version!;
-    const forged = await A.from("asset_versions")
+    // RLS grants no write policy, so a forged statement affects ZERO rows.
+    expect((await A.from("asset_versions")
       .update({ approved_by_user_bool: true, approved_at: new Date().toISOString() })
-      .eq("id", v.id).select();
-    expect(forged.error?.message).toMatch(/only by the server/);
+      .eq("id", v.id).select()).data).toEqual([]);
     expect((await getRow<AssetVersion>(A, "asset_versions", v.id))?.approved_by_user_bool).toBe(false);
+    expect((await A.from("asset_versions").delete().eq("id", v.id).select()).data).toEqual([]);
+    expect(await getRow<AssetVersion>(A, "asset_versions", v.id)).not.toBeNull();
+    const forgedInsert = await A.from("asset_versions")
+      .insert({ asset_fk: asset.id, version_number: 99, content: "forged", generated_by_model: "gpt-fake" })
+      .select();
+    expect(forgedInsert.error?.message).toMatch(/row-level security|permission denied/);
+    // …and the column guard still fires on the privileged path
+    await expect(
+      rawSql(`update public.asset_versions set approved_by_user_bool = true where id = '${v.id}'`),
+    ).rejects.toThrow(/only by the server/);
   });
 
-  it("a fabricated unblocking or supersession edit is rejected", async () => {
+  it("a blocked version cannot be unblocked or acknowledged, even privileged", async () => {
     const { asset, ach } = await seedAsset(A);
     await updateAchievement(A, ach.id, { truth_status: "DISPUTED" });
     await generateAssetVersion(A, asset.id, { transport: stub });
     const blocked = (await listRows<AssetVersion>(A, "asset_versions", { eq: { asset_fk: asset.id }, includeArchived: true }))[0];
     expect(blocked.blocked_bool).toBe(true);
-    const unblock = await A.from("asset_versions").update({ blocked_bool: false }).eq("id", blocked.id).select();
-    expect(unblock.error?.message).toMatch(/only by the server/);
-    const ack = await A.from("asset_versions").update({ attested_no_metric_ack_bool: true }).eq("id", blocked.id).select();
-    expect(ack.error?.message).toMatch(/only by the server/);
+    expect((await A.from("asset_versions").update({ blocked_bool: false }).eq("id", blocked.id).select()).data).toEqual([]);
+    await expect(
+      rawSql(`update public.asset_versions set blocked_bool = false where id = '${blocked.id}'`),
+    ).rejects.toThrow(/only by the server/);
+    await expect(
+      rawSql(`update public.asset_versions set attested_no_metric_ack_bool = true where id = '${blocked.id}'`),
+    ).rejects.toThrow(/only by the server/);
   });
 
   it("approval through the RPC still fails when the graph is ineligible", async () => {
@@ -574,5 +592,142 @@ describe("8. safety-critical transitions reject direct PostgREST bypass", () => 
     expect((await B.rpc("ccc_approve_asset_version", { p_version: v.id })).error).not.toBeNull();
     expect((await B.rpc("ccc_log_external_use", { p_version: v.id, p_destination: "steal" })).error).not.toBeNull();
     expect((await B.rpc("ccc_asset_graph_eligible", { p_asset: asset.id })).data).toMatchObject({ eligible: false });
+  });
+});
+
+describe("9. write bypasses closed at the table level", () => {
+  it("collection_assets is client-read-only; add and remove run through RPCs", async () => {
+    const { asset, ach } = await seedAsset(A);
+    const v = await approvedVersion(A, asset.id);
+    const coll = await createRow<{ id: string }>(A, "asset_collections", { name: "Resume", collection_type: "resume_version" });
+
+    // direct INSERT / UPDATE / DELETE all match nothing
+    const ins = await A.from("collection_assets")
+      .insert({ collection_fk: coll.id, asset_fk: asset.id, version_fk: v.id }).select();
+    expect(ins.error?.message).toMatch(/row-level security|permission denied/);
+    await addVersionToCollection(A, coll.id, v.id);
+    expect((await A.from("collection_assets").update({ membership_stale_bool: false }).eq("collection_fk", coll.id).select()).data).toEqual([]);
+    expect((await A.from("collection_assets").delete().eq("collection_fk", coll.id).select()).data).toEqual([]);
+    expect((await listRows(A, "collection_assets", { includeArchived: true })).length).toBe(1);
+
+    // the protected remove RPC works and re-checks the collection
+    await approveCollection(A, coll.id);
+    await setCurrentCollection(A, coll.id);
+    const removed = await A.rpc("ccc_remove_collection_version", { p_collection: coll.id, p_version: v.id });
+    expect(removed.error).toBeNull();
+    expect((await listRows(A, "collection_assets", { includeArchived: true })).length).toBe(0);
+    // an approved/current collection left EMPTY is demoted, not left standing
+    const after = await getRow<{ approved_by_user_bool: boolean; current_bool: boolean }>(A, "asset_collections", coll.id);
+    expect(after?.approved_by_user_bool).toBe(false);
+    expect(after?.current_bool).toBe(false);
+    expect(ach.id).toBeTruthy();
+  });
+
+  it("membership validation runs on UPDATE too, and rejects a version filed under the wrong asset", async () => {
+    const { asset } = await seedAsset(A);
+    const other = await seedAsset(A);
+    const v = await approvedVersion(A, asset.id);
+    const vOther = await approvedVersion(A, other.asset.id);
+    const coll = await createRow<{ id: string }>(A, "asset_collections", { name: "Pack", collection_type: "interview_pack" });
+    await addVersionToCollection(A, coll.id, v.id);
+    const memberId = (await listRows<{ id: string }>(A, "collection_assets", { includeArchived: true }))[0].id;
+
+    // even privileged, repointing a membership at another asset's version fails
+    await expect(
+      rawSql(`update public.collection_assets set version_fk = '${vOther.id}' where id = '${memberId}'`),
+    ).rejects.toThrow(/different asset/);
+
+    // and revalidation names the mismatch if one ever appeared
+    await rawSql(`do $$ begin
+      perform set_config('ccc.trusted_path','on',true);
+      update public.collection_assets set version_fk = '${vOther.id}' where id = '${memberId}';
+    end $$;`);
+    await A.rpc("ccc_revalidate_collection", { p_collection: coll.id });
+    const m = await getRow<{ membership_stale_bool: boolean; membership_stale_reason: string }>(A, "collection_assets", memberId);
+    expect(m?.membership_stale_bool).toBe(true);
+    expect(m?.membership_stale_reason).toMatch(/does not belong to the asset/);
+  });
+
+  it("a locked DELETE is rejected on EVERY maturity-gated P1 table", async () => {
+    const P1 = [
+      "companies", "contacts", "outreach", "referrals", "applications", "interviews",
+      "offers", "offer_scenarios", "counter_proposals", "comp_benchmarks",
+      "reference_application_uses", "counter_benchmarks",
+    ];
+    // Seed one row per table while unlocked…
+    await A.rpc("ccc_set_override", { p_key: "maturity_dev_override", p_enabled: true, p_reason: "seed" });
+    const company = await createRow<{ id: string }>(A, "companies", { name: "Doomed" });
+    const contact = await createRow<{ id: string }>(A, "contacts", { name: "Doomed", company_fk: company.id });
+    const application = await createRow<{ id: string }>(A, "applications", { role_title: "Doomed" });
+    const offer = await createRow<{ id: string }>(A, "offers", { role_title: "Doomed" });
+    const bench = await createRow<{ id: string }>(A, "comp_benchmarks", { role_title: "Doomed" });
+    const counter = await createRow<{ id: string }>(A, "counter_proposals", { offer_fk: offer.id, rationale: "x" });
+    await createRow(A, "outreach", { contact_fk: contact.id, summary: "x" });
+    await createRow(A, "referrals", { contact_fk: contact.id, application_fk: application.id });
+    await createRow(A, "interviews", { application_fk: application.id, round: "x" });
+    await createRow(A, "offer_scenarios", { offer_fk: offer.id, scenario_name: "x" });
+    await createRow(A, "counter_benchmarks", { counter_fk: counter.id, benchmark_fk: bench.id });
+    const ref = await createRow<{ id: string }>(A, "references", {
+      contact_fk: contact.id, reference_type: "manager",
+      willingness_status: "confirmed", willingness_confirmed_at: new Date().toISOString(),
+    });
+    await createRow(A, "reference_application_uses", { reference_fk: ref.id, application_fk: application.id });
+
+    // …then lock and prove every DELETE removes nothing.
+    await A.rpc("ccc_set_override", { p_key: "maturity_dev_override", p_enabled: false, p_reason: "lock" });
+    for (const t of P1) {
+      const before = (await listRows(A, t, { includeArchived: true })).length;
+      expect(before, `${t} should have a seeded row`).toBeGreaterThan(0);
+      const del = await A.from(t).delete().neq("id", "00000000-0000-0000-0000-000000000000").select();
+      expect(del.data ?? [], `${t} locked delete`).toEqual([]);
+      expect((await listRows(A, t, { includeArchived: true })).length, `${t} row survived`).toBe(before);
+      // UPDATE (including archive) is locked in the same breath. The two
+      // junction tables carry no lifecycle status, so touch a column they have.
+      const patch = ["reference_application_uses", "counter_benchmarks"].includes(t)
+        ? { created_at: new Date().toISOString() }
+        : { status: "archived" };
+      const upd = await A.from(t).update(patch).neq("id", "00000000-0000-0000-0000-000000000000").select();
+      expect(upd.data ?? [], `${t} locked update`).toEqual([]);
+      // INSERT is refused outright
+      const ins = await A.from(t).insert(t === "companies" ? { name: "nope" } : {}).select();
+      expect(ins.error, `${t} locked insert`).not.toBeNull();
+    }
+
+    // With the override active again, DELETE succeeds and is audited.
+    await A.rpc("ccc_set_override", { p_key: "maturity_dev_override", p_enabled: true, p_reason: "unlock for delete" });
+    const del = await A.from("comp_benchmarks").delete().eq("id", bench.id).select();
+    expect(del.error).toBeNull();
+    const audit = await A.from("override_mutations").select("*");
+    const rows = (audit.data ?? []) as Array<{ table_name: string; operation: string; reason_snapshot: string }>;
+    expect(rows.some((r) => r.table_name === "comp_benchmarks" && r.operation === "DELETE")).toBe(true);
+    expect(rows.every((r) => r.reason_snapshot)).toBe(true);
+  });
+
+  it("maturity and override state cannot be queried for another user", async () => {
+    const other = backend.userB.userId;
+    expect((await A.rpc("ccc_maturity_criteria", { uid: other })).error?.message).toMatch(/only for the calling user/);
+    // the parameterised implementations are not callable by a client at all
+    expect((await A.rpc("ccc_maturity_criteria_for", { uid: other })).error).not.toBeNull();
+    expect((await A.rpc("ccc_p1_unlocked_for", { uid: other })).error).not.toBeNull();
+    expect((await A.rpc("ccc_maturity_met_for", { uid: other })).error).not.toBeNull();
+    expect((await A.rpc("ccc_override_active_for", { uid: other })).error).not.toBeNull();
+    // the public predicates take no user at all
+    expect((await A.rpc("ccc_p1_unlocked", {})).error).toBeNull();
+    expect((await A.rpc("ccc_maturity_met", {})).error).toBeNull();
+    expect((await A.rpc("ccc_override_active", {})).error).toBeNull();
+  });
+
+  it("a hand-authored version is committed transactionally and cannot forge model metadata", async () => {
+    const { asset } = await seedAsset(A);
+    const v = await authorManualVersion(A, asset.id, "Hand-written bullet.");
+    expect(v.version_number).toBe(1);
+    expect(v.generated_by_model).toBe("");
+    expect(v.generation_prompt_hash).toBe("");
+    const a = await getRow<CareerAsset>(A, "career_assets", asset.id);
+    expect(a?.current_version_fk).toBe(v.id);
+    const empty = await A.rpc("ccc_author_manual_version", {
+      p_asset: asset.id, p_content: "   ", p_privacy: null, p_truth_summary: "",
+    });
+    expect(empty.error?.message).toMatch(/needs content/);
   });
 });
